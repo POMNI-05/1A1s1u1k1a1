@@ -1,18 +1,34 @@
-# secrets
+# Environment & secrets
 .env
 
-# python
-__pycache__/
-*.pyc
-
-# local folders
+# Raw downloaded data and outputs (financial data — never commit)
 v1_selenium/data/
 v1_selenium/output/
 v1_selenium/logs/
-
 v2_api/data/
 v2_api/output/
 v2_api/logs/
 
-# mac
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+.env
+data/
+output/
+logs/
+__pycache__/
+*.pyc

@@ -1,0 +1,7 @@
+we use the guide for 2025 rn, they usually enact and publish the guide at the end of May, 
+ - that guide is expected to be enforeced through 2024 - 2025 FY 
+ - where basically we follow it to complete tax return when concluding results now. 
+According to Chris, the most common adjustments are 7W (non-deductible expenses) and 7F (decline in value of depreciating assets).
+Also according to Chris, 7D (R&D expenditure in accounts) is very common for R&D claimants — these costs are added back in the reconciliation and claimed separately via the R&D schedule, so they don't get missed. 7B (other assessable income not in accounts) is also common, especially for forex gains and grants received.
+Also also according to Chris, the new 7Y (build to rent capital works deduction at 4%) is likely to be common for property developers, but may be less relevant for other industries. It's important to note that 7Y is a new addition for the 2024-25 income year and should be included in the reconciliation if applicable, but it should not be double-counted with 7I (capital works deductions) as they are separate line items on the ITR form.
+Also also also according to Chris, the removed labels 7J (small business skills and training boost) and 7K (small business energy incentive) were commonly used in prior years for eligible small businesses, but they were removed in the 2025 ITR form. If your client had these deductions in previous years, make sure to update your reconciliation adjustments accordingly and remove any references to these labels.

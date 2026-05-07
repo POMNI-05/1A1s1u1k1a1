@@ -234,35 +234,73 @@ def _is_data_row(account_name: str) -> bool:
     text = str(account_name or "").strip().lower()
     return text not in NON_DATA_ACCOUNT_WORDS
 
-
 def add_row_type(df: pd.DataFrame, account_col: str) -> pd.DataFrame:
+    """
+    Identify whether a row is:
+    - heading: yellow section heading such as Trading Income / Cost of Sales
+    - total: subtotal / total row such as Total Income / Gross Profit / Net Profit
+    - account: actual accounting entry
+    - blank: blank row
+
+    Only account rows should normally go into Tax Return Financial Data.
+    """
     out = df.copy()
+
+    heading_names = {
+        "trading income",
+        "income",
+        "revenue",
+        "cost of sales",
+        "other income",
+        "operating expenses",
+        "expenses",
+        "assets",
+        "current assets",
+        "non-current assets",
+        "liabilities",
+        "current liabilities",
+        "non-current liabilities",
+        "equity",
+        "bank",
+        "fixed assets",
+    }
+
+    total_exact_names = {
+        "gross profit",
+        "net profit",
+        "net loss",
+        "net assets",
+        "total income",
+        "total expenses",
+        "total trading income",
+        "total cost of sales",
+        "total other income",
+        "total operating expenses",
+        "total assets",
+        "total liabilities",
+        "total equity",
+    }
 
     def row_type(account_name: str) -> str:
         text = str(account_name or "").strip().lower()
-        if not text:
+        text = re.sub(r"\s+", " ", text)
+
+        if not text or text in {"nan", "none"}:
             return "blank"
-        if text.startswith("total") or text in {"gross profit", "net profit", "net assets"}:
-            return "total"
-        if text in {
-            "trading income",
-            "cost of sales",
-            "other income",
-            "operating expenses",
-            "assets",
-            "liabilities",
-            "equity",
-            "current assets",
-            "current liabilities",
-            "non-current assets",
-            "non-current liabilities",
-        }:
+
+        if text in heading_names:
             return "heading"
+
+        if text in total_exact_names:
+            return "total"
+
+        if text.startswith("total "):
+            return "total"
+
         return "account"
 
     out["Row Type"] = out[account_col].apply(row_type)
     return out
-
 
 def clean_report(filepath: str, report_label: str) -> pd.DataFrame:
     logger.info("Cleaning %s from %s", report_label, filepath)
@@ -284,6 +322,8 @@ def clean_report(filepath: str, report_label: str) -> pd.DataFrame:
         df[col] = clean_amount_column(df[col])
 
     df = add_row_type(df, account_col)
+    df = add_report_section(df, account_col)
+
     logger.info(
         "%s cleaned: %s rows, account_col=%s, amount_cols=%s, current=%s",
         report_label,
@@ -294,6 +334,34 @@ def clean_report(filepath: str, report_label: str) -> pd.DataFrame:
     )
     return df
 
+def clean_report(filepath: str, report_label: str) -> pd.DataFrame:
+    logger.info("Cleaning %s from %s", report_label, filepath)
+
+    start_row = find_data_start_row(filepath)
+    df = pd.read_excel(filepath, header=start_row)
+    df.columns = _normalise_column_names(df.columns)
+
+    # Excel row number = dataframe row index + header row + 2
+    # +1 because Excel is 1-based, +1 because data starts after header
+    df["Source Row"] = [start_row + 2 + i for i in range(len(df))]
+
+    df.dropna(how="all", inplace=True)
+    df.dropna(axis=1, how="all", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+
+    structure = detect_report_structure(df)
+    account_col = structure.account_col
+
+    df[account_col] = standardise_account_names(df[account_col])
+    df = df[df[account_col].apply(_is_data_row)].copy()
+
+    for col in structure.amount_cols:
+        df[col] = clean_amount_column(df[col])
+
+    df = add_row_type(df, account_col)
+    df = add_report_section(df, account_col)
+
+    return df
 
 def extract_value(
     df: pd.DataFrame,
@@ -341,3 +409,30 @@ def load_clean_reports() -> tuple[pd.DataFrame, pd.DataFrame]:
         clean_report(PL_RAW_PATH, "Profit and Loss"),
         clean_report(BS_RAW_PATH, "Balance Sheet"),
     )
+
+
+def add_report_section(df: pd.DataFrame, account_col: str) -> pd.DataFrame:
+    """
+    Use heading rows to assign section to following account rows.
+
+    Example:
+    Trading Income heading applies to Sales below it.
+    Operating Expenses heading applies to Advertising, Bank Fees, etc.
+    """
+    out = df.copy()
+    current_section = ""
+
+    section_values = []
+
+    for _, row in out.iterrows():
+        account_name = str(row[account_col] or "").strip()
+        text = account_name.lower()
+        row_type = row.get("Row Type", "")
+
+        if row_type == "heading":
+            current_section = account_name
+
+        section_values.append(current_section)
+
+    out["Report Section"] = section_values
+    return out

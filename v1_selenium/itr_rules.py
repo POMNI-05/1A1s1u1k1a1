@@ -2,22 +2,25 @@
 """
 ATO company tax return and workpaper mapping rules.
 
-Two separate ideas are kept separate:
-1. ACCOUNT_ITR_REFERENCE_MAP: account-name guidance for review only.
-2. WORKSHEET_2: actual tax reconciliation adjustment labels and directions.
+Important separation:
+1. FINANCIAL_LABEL_RULES:
+   Used only for labelling P&L / BS accounting entries in the workpaper.
+   These labels do NOT automatically change taxable income.
 
-The annotated P&L/BS sheets should not automatically change taxable income.
-Only configured TAX_ADJUSTMENTS affect taxable income.
+2. WORKSHEET_2:
+   Used for actual tax reconciliation adjustments.
+   Only amounts in TAX_ADJUSTMENTS are included in taxable income calculation.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Dict, List
+
 
 # ---------------------------------------------------------------------------
 # Tax rates and thresholds
 # ---------------------------------------------------------------------------
+
 TAX_RATES = {
     "base_rate_entity": 0.25,
     "general": 0.30,
@@ -35,10 +38,12 @@ SMALL_BUSINESS_THRESHOLDS = {
     "instant_asset_writeoff": 20_000,
 }
 
+
 # ---------------------------------------------------------------------------
 # Item 7 labels
 # ---------------------------------------------------------------------------
-ITEM_7_LABELS: Dict[str, dict] = {
+
+ITEM_7_LABELS = {
     "7T": {
         "name": "Total profit or loss",
         "direction": "base",
@@ -60,7 +65,7 @@ ITEM_7_LABELS: Dict[str, dict] = {
     "7D": {
         "name": "R&D expenditure in accounts subject to R&D tax incentive",
         "direction": "add",
-        "description": "R&D expenses in accounts added back and claimed through R&D workflow.",
+        "description": "Accounting expenditure subject to R&D tax incentive.",
         "active": True,
     },
     "7W": {
@@ -78,7 +83,7 @@ ITEM_7_LABELS: Dict[str, dict] = {
     "7I": {
         "name": "Capital works deductions",
         "direction": "subtract",
-        "description": "Division 43 capital works deductions.",
+        "description": "Division 43 capital works deduction.",
         "active": True,
     },
     "7Q": {
@@ -96,9 +101,8 @@ ITEM_7_LABELS: Dict[str, dict] = {
     "7Y": {
         "name": "Build to rent capital works deduction at 4%",
         "direction": "subtract",
-        "description": "Accelerated 4% deduction for eligible build-to-rent developments.",
+        "description": "Accelerated build-to-rent capital works deduction.",
         "active": True,
-        "added_in": "2025",
     },
     "7Z": {
         "name": "Section 40-880 deduction",
@@ -112,6 +116,8 @@ ITEM_7_LABELS: Dict[str, dict] = {
         "description": "Prior year tax losses applied against current year taxable income.",
         "active": True,
     },
+
+    # Historical / inactive labels kept so old files fail clearly.
     "7J": {
         "name": "Small business skills and training boost",
         "direction": "subtract",
@@ -128,14 +134,17 @@ ITEM_7_LABELS: Dict[str, dict] = {
     },
 }
 
+
 # ---------------------------------------------------------------------------
-# Worksheet 2 categories - these control actual add/subtract direction
+# Worksheet 2 categories
+# These control actual add/subtract direction in tax reconciliation.
 # ---------------------------------------------------------------------------
-WORKSHEET_2: Dict[str, dict] = {
+
+WORKSHEET_2 = {
     "add_back_7W": {
         "label": "7W",
         "direction": "add",
-        "heading": "Non-deductible expenses (Item 7W)",
+        "heading": "Non-deductible expenses",
         "examples": [
             "Non-deductible entertainment",
             "Penalties and fines",
@@ -147,246 +156,328 @@ WORKSHEET_2: Dict[str, dict] = {
     "add_back_7D": {
         "label": "7D",
         "direction": "add",
-        "heading": "R&D expenditure in accounts (Item 7D)",
-        "examples": ["R&D expenses charged to accounts and claimed under the R&D schedule"],
+        "heading": "R&D expenditure in accounts",
+        "examples": [
+            "R&D expenditure charged to accounts and claimed under R&D tax incentive",
+        ],
     },
     "add_back_7B": {
         "label": "7B",
         "direction": "add",
-        "heading": "Other assessable income not in accounts (Item 7B)",
-        "examples": ["Assessable grants not in accounts", "Taxable forex gain not in accounts"],
+        "heading": "Other assessable income not in accounts",
+        "examples": [
+            "Assessable grants not in accounts",
+            "Taxable forex gains not in accounts",
+        ],
     },
+
     "subtract_7X": {
         "label": "7X",
         "direction": "subtract",
-        "heading": "Other deductible expenses (Item 7X)",
-        "examples": ["Deductible expense not recorded in accounts", "Prior year provision paid this year"],
+        "heading": "Other deductible expenses",
+        "examples": [
+            "Deductible expenses not recorded in accounts",
+            "Prior year provisions paid this year",
+            "Allowable superannuation fund payments",
+        ],
     },
     "subtract_7F": {
         "label": "7F",
         "direction": "subtract",
-        "heading": "Decline in value - depreciating assets (Item 7F)",
-        "examples": ["Tax depreciation per fixed asset schedule"],
+        "heading": "Decline in value of depreciating assets",
+        "examples": [
+            "Tax depreciation per fixed asset schedule",
+        ],
     },
     "subtract_7Z": {
         "label": "7Z",
         "direction": "subtract",
-        "heading": "Section 40-880 deduction (Item 7Z)",
-        "examples": ["Business establishment costs deductible over five years"],
+        "heading": "Section 40-880 deduction",
+        "examples": [
+            "Business establishment costs deductible over five years",
+        ],
     },
     "subtract_7I": {
         "label": "7I",
         "direction": "subtract",
-        "heading": "Capital works deductions (Item 7I)",
-        "examples": ["Division 43 capital works deduction"],
+        "heading": "Capital works deductions",
+        "examples": [
+            "Division 43 capital works deduction",
+        ],
     },
     "subtract_7Y": {
         "label": "7Y",
         "direction": "subtract",
-        "heading": "Build to rent capital works - 4% (Item 7Y)",
-        "examples": ["Eligible build-to-rent capital works deduction"],
+        "heading": "Build to rent capital works deduction at 4%",
+        "examples": [
+            "Eligible build-to-rent capital works deduction",
+        ],
     },
     "subtract_7Q": {
         "label": "7Q",
         "direction": "subtract",
-        "heading": "Income in accounts not assessable (Item 7Q)",
-        "examples": ["Exempt income", "Accounting gain not assessable"],
+        "heading": "Other income not included in assessable income",
+        "examples": [
+            "Exempt income",
+            "Accounting gain not assessable",
+            "Unrealised gains on fair value revaluation",
+        ],
     },
     "subtract_7R": {
         "label": "7R",
         "direction": "subtract",
-        "heading": "Tax losses deducted (Item 7R)",
-        "examples": ["Prior year tax losses applied"],
+        "heading": "Tax losses deducted",
+        "examples": [
+            "Prior year tax losses applied",
+        ],
     },
 }
 
+
 # ---------------------------------------------------------------------------
-# Account mapping - review guidance only, not calculation logic
+# Financial Data labelling rules
+# These are guidance only. They do not affect taxable income calculation.
 # ---------------------------------------------------------------------------
-ACCOUNT_ITR_REFERENCE_MAP: Dict[str, List[dict]] = {
+
+FINANCIAL_LABEL_RULES = {
     "profit_and_loss": [
         {
-            "patterns": [r"^sales$", r"^revenue$", r"^trading income$", r"^income$"],
-            "itr_ref": "6B",
-            "category": "Gross income",
-            "review_note": "Usually included in accounting profit. Review ITR income disclosure.",
-            "decision_logic": "Matched as income account by name. Guidance only; no tax adjustment created.",
+            "patterns": [r"sales", r"revenue", r"consulting income", r"trading income"],
+            "itr_ref": "6C",
+            "itr_label": "Gross income / business income",
+            "treatment": "financial_label_only",
+            "confidence": "high",
+            "review_note": "",
+            "reason": "Matched income/revenue account name.",
         },
         {
-            "patterns": [r"^interest income$", r"interest received"],
+            "patterns": [r"interest income", r"interest received"],
             "itr_ref": "6G",
-            "category": "Interest income",
-            "review_note": "Review whether separately disclosed as interest income.",
-            "decision_logic": "Matched as interest income. Included in profit unless accountant adjusts.",
+            "itr_label": "Interest income",
+            "treatment": "financial_label_only",
+            "confidence": "high",
+            "review_note": "Check whether interest is separately disclosed.",
+            "reason": "Matched interest income account.",
         },
         {
-            "patterns": [r"^purchases$", r"^cost of sales$", r"^cost of goods sold$"],
+            "patterns": [r"purchases", r"cost of sales", r"cost of goods sold"],
             "itr_ref": "6A",
-            "category": "Cost of sales",
-            "review_note": "Review trading stock / cost of sales treatment.",
-            "decision_logic": "Matched as cost of sales. Already included in accounting profit.",
+            "itr_label": "Cost of sales",
+            "treatment": "financial_label_only",
+            "confidence": "high",
+            "review_note": "Review trading stock / cost of sales treatment if relevant.",
+            "reason": "Matched cost of sales account.",
         },
         {
             "patterns": [r"wages", r"salaries", r"payroll"],
             "itr_ref": "8D",
-            "category": "Labour costs",
-            "review_note": "Review PAYG, super, contractor split and unpaid super issues.",
-            "decision_logic": "Matched as labour cost. Usually deductible but no automatic tax adjustment.",
+            "itr_label": "Salary and wage expenses",
+            "treatment": "financial_label_only",
+            "confidence": "high",
+            "review_note": "Review PAYG, super, contractor split if relevant.",
+            "reason": "Matched wages/salary account.",
         },
         {
-            "patterns": [r"^rent$", r"lease"],
+            "patterns": [r"superannuation", r"\bsuper\b"],
+            "itr_ref": "8D / 7W review",
+            "itr_label": "Superannuation expense",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Unpaid super may require add-back. Check payment timing.",
+            "reason": "Superannuation may need timing review.",
+        },
+        {
+            "patterns": [r"annual leave", r"long service leave", r"provision"],
+            "itr_ref": "7W / 7X review",
+            "itr_label": "Leave provision / accrual",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Provision movements may require tax reconciliation adjustment.",
+            "reason": "Leave/provision accounts are timing-sensitive.",
+        },
+        {
+            "patterns": [r"rent", r"lease"],
             "itr_ref": "8H",
-            "category": "Rent / lease expense",
-            "review_note": "Review lease/rent deductibility and private use if relevant.",
-            "decision_logic": "Matched as expense account. Already included in accounting profit.",
+            "itr_label": "Rent / lease expense",
+            "treatment": "financial_label_only",
+            "confidence": "medium",
+            "review_note": "Review private or capital component if relevant.",
+            "reason": "Matched rent/lease account.",
         },
         {
             "patterns": [r"advertising", r"marketing"],
             "itr_ref": "8R",
-            "category": "Advertising",
-            "review_note": "Generally deductible, subject to review.",
-            "decision_logic": "Matched as ordinary expense. No automatic add-back or deduction.",
+            "itr_label": "Other deductible expense",
+            "treatment": "financial_label_only",
+            "confidence": "medium",
+            "review_note": "",
+            "reason": "Matched ordinary operating expense.",
         },
         {
             "patterns": [r"bank fee", r"merchant fee"],
             "itr_ref": "8R",
-            "category": "Bank fees",
-            "review_note": "Generally deductible, subject to review.",
-            "decision_logic": "Matched as ordinary expense. No automatic add-back or deduction.",
+            "itr_label": "Other deductible expense",
+            "treatment": "financial_label_only",
+            "confidence": "medium",
+            "review_note": "",
+            "reason": "Matched bank/merchant fee account.",
         },
         {
-            "patterns": [r"consult", r"accounting", r"bookkeeping", r"professional fee"],
+            "patterns": [r"accounting", r"bookkeeping", r"consulting", r"professional fee"],
             "itr_ref": "8R",
-            "category": "Professional fees",
-            "review_note": "Review capital/private/non-deductible portion if applicable.",
-            "decision_logic": "Matched as professional fee. Review only; manual 7W if non-deductible.",
+            "itr_label": "Professional fees",
+            "treatment": "financial_label_only",
+            "confidence": "medium",
+            "review_note": "Review capital/private/non-deductible portion if relevant.",
+            "reason": "Matched professional fee account.",
         },
         {
             "patterns": [r"legal"],
-            "itr_ref": "8R / 7W",
-            "category": "Legal expenses",
-            "review_note": "Review whether deductible, capital, private, or non-deductible.",
-            "decision_logic": "Flagged for accountant review. Manual 7W add-back only if needed.",
+            "itr_ref": "8R / 7W review",
+            "itr_label": "Legal expenses",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Legal costs may be deductible, capital, private, or non-deductible. Review required.",
+            "reason": "Legal expenses depend on nature of cost.",
         },
         {
-            "patterns": [r"entertainment"],
+            "patterns": [r"entertainment", r"meal", r"refreshment"],
             "itr_ref": "7W review",
-            "category": "Entertainment",
-            "review_note": "Often partly or fully non-deductible. Review for add-back.",
-            "decision_logic": "Flagged only. Add to add_back_7W manually if non-deductible.",
+            "itr_label": "Potential non-deductible entertainment",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Entertainment may be partly or fully non-deductible. Manual add-back only if confirmed.",
+            "reason": "Entertainment often requires deductibility review.",
         },
         {
             "patterns": [r"depreciation", r"amortisation", r"amortization"],
-            "itr_ref": "7W / 7F",
-            "category": "Depreciation / amortisation",
-            "review_note": "Usually add back accounting depreciation/amortisation and claim tax depreciation separately.",
-            "decision_logic": "Requires fixed asset workpaper. No automatic adjustment from P&L alone.",
+            "itr_ref": "7W / 7F review",
+            "itr_label": "Book depreciation / amortisation",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Accounting depreciation may be added back; tax depreciation comes from fixed asset schedule.",
+            "reason": "Book depreciation and tax depreciation are different calculations.",
+        },
+        {
+            "patterns": [r"r&d", r"research and development", r"research & development"],
+            "itr_ref": "7D review",
+            "itr_label": "R&D expenditure",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "R&D expenditure may need separate R&D schedule and Item 7D add-back.",
+            "reason": "R&D accounts require separate tax incentive review.",
+        },
+        {
+            "patterns": [r"forex", r"foreign exchange", r"fx"],
+            "itr_ref": "7B / 7Q / 7X review",
+            "itr_label": "Foreign exchange gain/loss",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Forex treatment may differ between accounting and tax.",
+            "reason": "Forex accounts can require tax reconciliation treatment.",
         },
         {
             "patterns": [r"motor vehicle", r"vehicle", r"fuel"],
-            "itr_ref": "8R",
-            "category": "Motor vehicle expenses",
+            "itr_ref": "8R review",
+            "itr_label": "Motor vehicle expenses",
+            "treatment": "review_only",
+            "confidence": "medium",
             "review_note": "Review private-use adjustment and substantiation.",
-            "decision_logic": "Matched as vehicle expense. Manual adjustment if private/non-deductible portion exists.",
+            "reason": "Vehicle expenses may have private-use component.",
+        },
+        {
+            "patterns": [r"travel", r"accommodation"],
+            "itr_ref": "8R review",
+            "itr_label": "Travel expenses",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Review substantiation/private component.",
+            "reason": "Travel accounts can require review.",
         },
         {
             "patterns": [r"telephone", r"internet", r"mobile"],
-            "itr_ref": "8R",
-            "category": "Telephone and internet",
+            "itr_ref": "8R review",
+            "itr_label": "Telephone and internet",
+            "treatment": "financial_label_only",
+            "confidence": "medium",
             "review_note": "Review private-use adjustment if relevant.",
-            "decision_logic": "Matched as ordinary expense. No automatic tax adjustment.",
-        },
-        {
-            "patterns": [r"travel", r"accommodation", r"freight", r"courier"],
-            "itr_ref": "8R",
-            "category": "Travel / freight",
-            "review_note": "Review substantiation and private component if applicable.",
-            "decision_logic": "Matched as expense account. Manual adjustment only if required.",
-        },
-        {
-            "patterns": [r"^net profit", r"profit.*loss", r"total profit", r"current year earnings"],
-            "itr_ref": "7T",
-            "category": "Accounting profit/loss",
-            "review_note": "Starting point for Item 7 reconciliation.",
-            "decision_logic": "Used as base accounting profit where identified.",
-        },
-        {
-            "patterns": [r"^total ", r"^gross profit$"],
-            "itr_ref": "Check",
-            "category": "Subtotal / total row",
-            "review_note": "Subtotal rows are for checking and should not be manually mapped as accounts.",
-            "decision_logic": "Detected as subtotal/total. Review only.",
+            "reason": "Matched phone/internet account.",
         },
     ],
+
     "balance_sheet": [
         {
             "patterns": [r"bank", r"cash"],
-            "itr_ref": "Assets",
-            "category": "Cash assets",
-            "review_note": "Balance sheet disclosure only, not Item 7 taxable income.",
-            "decision_logic": "Matched as BS asset. Does not affect taxable income calculation.",
+            "itr_ref": "BS",
+            "itr_label": "Cash assets",
+            "treatment": "financial_label_only",
+            "confidence": "high",
+            "review_note": "",
+            "reason": "Matched bank/cash account.",
         },
         {
             "patterns": [r"receivable", r"debtor"],
-            "itr_ref": "Assets",
-            "category": "Receivables",
-            "review_note": "Review collectability and GST/tax timing if relevant.",
-            "decision_logic": "Matched as BS asset. Review only.",
-        },
-        {
-            "patterns": [r"inventory", r"stock"],
-            "itr_ref": "Assets",
-            "category": "Trading stock",
-            "review_note": "Review opening/closing trading stock treatment.",
-            "decision_logic": "Matched as stock. May inform tax review but no automatic Item 7 adjustment.",
-        },
-        {
-            "patterns": [r"payable", r"creditor"],
-            "itr_ref": "Liabilities",
-            "category": "Payables",
-            "review_note": "Review unpaid accruals/provisions if material.",
-            "decision_logic": "Matched as liability. Review only.",
+            "itr_ref": "BS",
+            "itr_label": "Receivables",
+            "treatment": "financial_label_only",
+            "confidence": "medium",
+            "review_note": "Review bad debts / collectability if material.",
+            "reason": "Matched receivable/debtor account.",
         },
         {
             "patterns": [r"gst", r"bas"],
-            "itr_ref": "Liabilities / Assets",
-            "category": "GST balance",
+            "itr_ref": "BS review",
+            "itr_label": "GST balance",
+            "treatment": "review_only",
+            "confidence": "medium",
             "review_note": "GST should not be treated as income tax payable.",
-            "decision_logic": "Matched as GST. Review only.",
+            "reason": "Matched GST/BAS balance.",
         },
         {
-            "patterns": [r"payg", r"superannuation", r"super payable"],
-            "itr_ref": "Liabilities / 7W review",
-            "category": "Payroll liabilities",
-            "review_note": "Unpaid super may require add-back at 7W.",
-            "decision_logic": "Flagged for review. Manual 7W only if tax rule requires.",
+            "patterns": [r"payg", r"superannuation payable", r"super payable"],
+            "itr_ref": "7W review",
+            "itr_label": "Payroll liability",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Unpaid super may require add-back. Check payment timing.",
+            "reason": "Payroll liabilities may affect tax adjustment review.",
+        },
+        {
+            "patterns": [r"annual leave", r"long service leave", r"provision"],
+            "itr_ref": "7W / 7X review",
+            "itr_label": "Provision / leave liability",
+            "treatment": "review_only",
+            "confidence": "medium",
+            "review_note": "Provision movement may require tax reconciliation adjustment.",
+            "reason": "Provision balances may not be deductible until paid/incurred for tax.",
         },
         {
             "patterns": [r"loan", r"borrow", r"finance"],
-            "itr_ref": "Liabilities",
-            "category": "Loans / borrowings",
-            "review_note": "Review related party balances and interest deductibility if relevant.",
-            "decision_logic": "Matched as liability. Review only.",
+            "itr_ref": "BS review",
+            "itr_label": "Loans / borrowings",
+            "treatment": "financial_label_only",
+            "confidence": "medium",
+            "review_note": "Review related-party balances and interest treatment if relevant.",
+            "reason": "Matched loan/borrowing account.",
         },
         {
             "patterns": [r"retained earnings", r"current year earnings", r"equity"],
-            "itr_ref": "Equity",
-            "category": "Equity",
-            "review_note": "Balance sheet check only.",
-            "decision_logic": "Matched as equity. Does not directly affect taxable income calculation.",
-        },
-        {
-            "patterns": [r"^total assets$", r"^total liabilities$", r"^total equity$", r"^net assets$"],
-            "itr_ref": "BS Check",
-            "category": "Balance sheet check",
-            "review_note": "Used for review/checking, not directly Item 7.",
-            "decision_logic": "Detected as BS total/check row.",
+            "itr_ref": "BS",
+            "itr_label": "Equity",
+            "treatment": "financial_label_only",
+            "confidence": "medium",
+            "review_note": "",
+            "reason": "Matched equity account.",
         },
     ],
 }
 
 
-def get_active_labels() -> List[str]:
+# ---------------------------------------------------------------------------
+# Helper functions
+# ---------------------------------------------------------------------------
+
+def get_active_labels() -> list[str]:
     return [label for label, info in ITEM_7_LABELS.items() if info.get("active")]
 
 
@@ -399,6 +490,7 @@ def get_label_info(label: str) -> dict:
 def validate_adjustment_label(label: str, description: str = "") -> None:
     if label not in ITEM_7_LABELS:
         raise ValueError(f"Unknown ITR label '{label}' in adjustment '{description}'.")
+
     if not ITEM_7_LABELS[label].get("active", False):
         removed = ITEM_7_LABELS[label].get("removed_in", "unknown year")
         raise ValueError(
@@ -407,22 +499,43 @@ def validate_adjustment_label(label: str, description: str = "") -> None:
         )
 
 
-def match_account_to_itr(account_name: str, report_type: str) -> dict:
+def match_financial_label(account_name: str, report_type: str) -> dict:
+    """
+    Match an accounting entry to an ITR financial label.
+
+    This is guidance only.
+    It does not create tax reconciliation adjustments.
+    """
     text = str(account_name or "").strip().lower()
 
-    for rule in ACCOUNT_ITR_REFERENCE_MAP.get(report_type, []):
+    for rule in FINANCIAL_LABEL_RULES.get(report_type, []):
         for pattern in rule.get("patterns", []):
             if re.search(pattern, text):
                 return {
-                    "itr_ref": rule.get("itr_ref", ""),
-                    "category": rule.get("category", ""),
-                    "review_note": rule.get("review_note", ""),
-                    "decision_logic": rule.get("decision_logic", "Matched by configured account-name rule."),
+                    "ITR Ref": rule.get("itr_ref", ""),
+                    "ITR Label": rule.get("itr_label", ""),
+                    "Treatment": rule.get("treatment", "financial_label_only"),
+                    "Confidence": rule.get("confidence", ""),
+                    "Review Note": rule.get("review_note", ""),
+                    "Label Reason": rule.get("reason", "Matched by configured financial label rule."),
                 }
 
     return {
-        "itr_ref": "",
-        "category": "Unmapped",
-        "review_note": "Review and map manually if material.",
-        "decision_logic": "No account-name rule matched. Left unmapped for accountant review.",
+        "ITR Ref": "",
+        "ITR Label": "Unmapped",
+        "Treatment": "review_only",
+        "Confidence": "low",
+        "Review Note": "No ITR rule matched. Review manually if material.",
+        "Label Reason": "No configured financial label rule matched this account name.",
+    }
+
+
+# Backward-compatible alias, in case older files still import this.
+def match_account_to_itr(account_name: str, report_type: str) -> dict:
+    result = match_financial_label(account_name, report_type)
+    return {
+        "itr_ref": result.get("ITR Ref", ""),
+        "category": result.get("ITR Label", ""),
+        "review_note": result.get("Review Note", ""),
+        "decision_logic": result.get("Label Reason", ""),
     }

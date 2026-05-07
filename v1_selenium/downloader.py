@@ -1,26 +1,40 @@
 # v1_selenium/downloader.py
+"""
+Selenium download layer for V1.
 
-import os
-import time
-import shutil
+Keep this file only responsible for Xero UI download. Cleaning, tax logic and
+workbook construction should remain in cleaner.py / workpaper_builder.py.
+"""
+
+from __future__ import annotations
+
 import logging
+import os
+import shutil
+import time
+
 from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
+
 from config import (
-    XERO_EMAIL, XERO_PASSWORD,
-    REPORT_END_DATE, COMPARE_WITH, FILTER,
-    DOWNLOAD_DIR, PL_RAW_PATH, BS_RAW_PATH,
-    HEADLESS, DOWNLOAD_WAIT
+    BS_RAW_PATH,
+    DOWNLOAD_DIR,
+    DOWNLOAD_WAIT,
+    HEADLESS,
+    PL_RAW_PATH,
+    REPORT_END_DATE,
+    XERO_EMAIL,
+    XERO_PASSWORD,
 )
 
 logger = logging.getLogger(__name__)
 
+
 def build_driver():
-    """Set up Chrome with auto-download to data/ folder."""
     options = webdriver.ChromeOptions()
     prefs = {
         "download.default_directory": DOWNLOAD_DIR,
@@ -29,175 +43,129 @@ def build_driver():
     }
     options.add_experimental_option("prefs", prefs)
     if HEADLESS:
-        options.add_argument("--headless")
+        options.add_argument("--headless=new")
 
-    driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
-        options=options
-    )
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
     driver.maximize_window()
     return driver
 
 
-def wait_for_download(filename_prefix, timeout=DOWNLOAD_WAIT):
-    """Block until a matching .xlsx file appears in DOWNLOAD_DIR."""
-    logger.info(f"Waiting for download: {filename_prefix}...")
-    elapsed = 0
-    while elapsed < timeout:
-        files = os.listdir(DOWNLOAD_DIR)
-        for f in files:
-            if f.endswith(".xlsx") and not f.endswith(".crdownload"):
-                return os.path.join(DOWNLOAD_DIR, f)
+def wait_for_download(timeout: int = DOWNLOAD_WAIT) -> str:
+    logger.info("Waiting for Xero Excel download...")
+    before = set(os.listdir(DOWNLOAD_DIR)) if os.path.exists(DOWNLOAD_DIR) else set()
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        files = [f for f in os.listdir(DOWNLOAD_DIR) if f.endswith(".xlsx") and not f.endswith(".crdownload")]
+        new_files = [f for f in files if f not in before]
+        candidates = new_files or files
+        if candidates:
+            candidates.sort(key=lambda f: os.path.getmtime(os.path.join(DOWNLOAD_DIR, f)), reverse=True)
+            return os.path.join(DOWNLOAD_DIR, candidates[0])
         time.sleep(1)
-        elapsed += 1
-    raise TimeoutError(f"Download did not complete within {timeout}s")
+
+    raise TimeoutError(f"Download did not complete within {timeout} seconds.")
 
 
 def login(driver):
-    """Navigate to Xero login and enter credentials.
-    MFA must be completed manually in the browser window.
-    """
-    logger.info("Navigating to Xero login...")
+    if not XERO_EMAIL or not XERO_PASSWORD:
+        raise ValueError("XERO_EMAIL and XERO_PASSWORD must be set when USE_SELENIUM=True.")
+
+    logger.info("Navigating to Xero login")
     driver.get("https://login.xero.com/")
+    wait = WebDriverWait(driver, 30)
 
-    wait = WebDriverWait(driver, 20)
-
-    # Enter email
     email_field = wait.until(EC.presence_of_element_located((By.ID, "email")))
     email_field.clear()
     email_field.send_keys(XERO_EMAIL)
-
-    # Click continue / next
     driver.find_element(By.ID, "submitButton").click()
 
-    # Enter password
     password_field = wait.until(EC.presence_of_element_located((By.ID, "password")))
     password_field.clear()
     password_field.send_keys(XERO_PASSWORD)
     driver.find_element(By.ID, "submitButton").click()
 
-    # ── MFA PAUSE ──────────────────────────────────────────────
-    # Xero will prompt for 2FA here.
-    # Complete it manually in the browser window.
-    # Script waits up to 60 seconds for dashboard to appear.
-    logger.info("Waiting for MFA completion (complete manually in browser)...")
-    wait_mfa = WebDriverWait(driver, 60)
-    wait_mfa.until(EC.url_contains("xero.com/dashboard"))
-    logger.info("Login successful.")
+    logger.info("Complete MFA manually if prompted.")
+    WebDriverWait(driver, 120).until(lambda d: "xero.com" in d.current_url.lower())
 
 
-def verify_and_set_report_settings(driver, wait):
-    """
-    CHECKPOINT: Verify report date, compare period, and filter.
-    Adjusts settings if they don't match config values.
-    """
-    logger.info("Verifying report settings...")
+def open_report(driver, report_type: str):
+    if report_type == "PL":
+        url = "https://go.xero.com/Reports/ProfitAndLoss.aspx"
+    elif report_type == "BS":
+        url = "https://go.xero.com/Reports/BalanceSheet.aspx"
+    else:
+        raise ValueError("report_type must be 'PL' or 'BS'.")
 
-    # These selectors may need adjusting based on live Xero UI
-    # End date check
+    logger.info("Opening report %s", report_type)
+    driver.get(url)
+    time.sleep(5)
+
+
+def verify_report_settings(driver):
+    """Best-effort setting check. Xero UI selectors change often, so keep this defensive."""
+    wait = WebDriverWait(driver, 15)
     try:
-        end_date_field = wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "input[data-automationid='end-date']")
-        ))
-        current = end_date_field.get_attribute("value")
-        if REPORT_END_DATE not in current:
-            logger.warning(f"End date mismatch: found '{current}', setting to '{REPORT_END_DATE}'")
-            end_date_field.clear()
-            end_date_field.send_keys(REPORT_END_DATE)
-        else:
-            logger.info(f"✓ End date correct: {current}")
-    except Exception as e:
-        logger.warning(f"Could not verify end date: {e}")
+        date_fields = driver.find_elements(By.CSS_SELECTOR, "input")
+        for field in date_fields:
+            value = field.get_attribute("value") or ""
+            if "Jun" in value or "June" in value or "202" in value:
+                logger.info("Report date field currently shows: %s", value)
+                break
+        logger.info("Expected report end date: %s", REPORT_END_DATE)
+    except Exception as exc:
+        logger.warning("Could not verify report date settings: %s", exc)
 
-    # Compare with check
     try:
-        compare_dropdown = wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "select[data-automationid='compare-with']")
-        ))
-        if COMPARE_WITH not in compare_dropdown.get_attribute("value"):
-            logger.warning(f"Compare period wrong, updating to '{COMPARE_WITH}'")
-            # Select the correct option
-            from selenium.webdriver.support.ui import Select
-            Select(compare_dropdown).select_by_visible_text(COMPARE_WITH)
-        else:
-            logger.info(f"✓ Compare with correct: {COMPARE_WITH}")
-    except Exception as e:
-        logger.warning(f"Could not verify compare period: {e}")
-
-    # Click Update to apply settings
-    try:
-        update_btn = wait.until(EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "button[data-automationid='update-button']")
-        ))
-        update_btn.click()
-        time.sleep(3)  # wait for report to refresh
-        logger.info("✓ Clicked Update.")
-    except Exception as e:
-        logger.warning(f"Could not click Update: {e}")
+        update_buttons = driver.find_elements(By.XPATH, "//button[contains(., 'Update')]")
+        if update_buttons:
+            wait.until(EC.element_to_be_clickable(update_buttons[0])).click()
+            time.sleep(4)
+    except Exception as exc:
+        logger.warning("Could not click Update button: %s", exc)
 
 
-def export_as_excel(driver, wait):
-    """Click Export → Excel and wait for download."""
-    logger.info("Exporting as Excel...")
-    try:
-        export_btn = wait.until(EC.element_to_be_clickable(
-            (By.CSS_SELECTOR, "button[data-automationid='export-button']")
-        ))
-        export_btn.click()
-        time.sleep(1)
+def export_as_excel(driver):
+    wait = WebDriverWait(driver, 30)
+    logger.info("Exporting report as Excel")
 
-        excel_option = wait.until(EC.element_to_be_clickable(
-            (By.XPATH, "//span[contains(text(), 'Excel')]")
-        ))
-        excel_option.click()
-        logger.info("Excel export triggered.")
-    except Exception as e:
-        logger.error(f"Export failed: {e}")
-        raise
+    export_candidates = [
+        (By.XPATH, "//button[contains(., 'Export')]") ,
+        (By.XPATH, "//*[contains(text(), 'Export')]") ,
+    ]
+
+    export_btn = None
+    for locator in export_candidates:
+        try:
+            export_btn = wait.until(EC.element_to_be_clickable(locator))
+            break
+        except Exception:
+            continue
+
+    if export_btn is None:
+        raise RuntimeError("Could not find Xero Export button.")
+
+    export_btn.click()
+    time.sleep(1)
+
+    excel_option = wait.until(EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Excel') or contains(text(), 'XLSX')]") ))
+    excel_option.click()
 
 
 def download_report(report_type: str):
-    """
-    Full flow for one report: login → navigate → verify settings → export.
-    report_type: 'PL' or 'BS'
-    """
-    assert report_type in ("PL", "BS"), "report_type must be 'PL' or 'BS'"
-
-    report_urls = {
-        "PL": "https://reporting.xero.com/!{orgid}/Reports/ProfitAndLoss",
-        "BS": "https://reporting.xero.com/!{orgid}/Reports/BalanceSheet",
-    }
-    dest_paths = {
-        "PL": PL_RAW_PATH,
-        "BS": BS_RAW_PATH,
-    }
+    dest_path = PL_RAW_PATH if report_type == "PL" else BS_RAW_PATH if report_type == "BS" else None
+    if dest_path is None:
+        raise ValueError("report_type must be 'PL' or 'BS'.")
 
     driver = build_driver()
-    wait = WebDriverWait(driver, 20)
-
     try:
         login(driver)
-
-        logger.info(f"Navigating to {report_type} report...")
-        # Navigate via Reports menu (more reliable than hardcoded URL)
-        driver.find_element(By.LINK_TEXT, "Reports").click()
-        time.sleep(2)
-
-        if report_type == "PL":
-            driver.find_element(By.PARTIAL_LINK_TEXT, "Profit and Loss").click()
-        else:
-            driver.find_element(By.PARTIAL_LINK_TEXT, "Balance Sheet").click()
-
-        time.sleep(3)  # let report load
-
-        verify_and_set_report_settings(driver, wait)
-        export_as_excel(driver, wait)
-
-        downloaded = wait_for_download(report_type)
-
-        # Rename and move to expected path
-        shutil.move(downloaded, dest_paths[report_type])
-        logger.info(f"✓ {report_type} saved to {dest_paths[report_type]}")
-
+        open_report(driver, report_type)
+        verify_report_settings(driver)
+        export_as_excel(driver)
+        downloaded = wait_for_download()
+        shutil.move(downloaded, dest_path)
+        logger.info("%s report saved to %s", report_type, dest_path)
     finally:
         driver.quit()

@@ -1,156 +1,343 @@
 # v1_selenium/cleaner.py
+"""
+Load and clean Xero P&L / Balance Sheet exports.
+
+Main improvements:
+- More robust header detection.
+- Separates account column detection from amount column detection.
+- Keeps all period amount columns instead of only one fixed column.
+- Ignores variance percentage columns when choosing the current amount column.
+- Distinguishes between "found zero" and "not found".
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+from typing import Iterable, List, Optional
 
 import pandas as pd
-import logging
+
 from config import PL_RAW_PATH, BS_RAW_PATH
 
 logger = logging.getLogger(__name__)
 
-# ── Alias lists ───────────────────────────────────────────────────────────────
 NET_PROFIT_ALIASES = [
     "net profit",
+    "net profit/(loss)",
+    "net profit / loss",
     "profit / loss",
+    "profit and loss",
     "profit after tax",
     "profit (loss)",
     "net income",
-    "operating profit",
-    "total income",
+    "current year earnings",
 ]
 
-TOTAL_ASSETS_ALIASES = [
-    "total assets",
-    "assets total",
-]
+TOTAL_ASSETS_ALIASES = ["total assets", "assets total"]
+TOTAL_LIABILITIES_ALIASES = ["total liabilities", "liabilities total"]
+TOTAL_EQUITY_ALIASES = ["total equity", "equity total"]
+NET_ASSETS_ALIASES = ["net assets"]
 
-TOTAL_LIABILITIES_ALIASES = [
-    "total liabilities",
-    "liabilities total",
-    "net assets",
-]
-
-
-# ── Header检测 ────────────────────────────────────────────────────────────────
-# 原注释版：nrows=20，扫描上限太低
-# 修复：改成nrows=30，兜底从row 0开始而不是崩溃
-def find_data_start_row(filepath: str) -> int:
-    preview = pd.read_excel(filepath, header=None, nrows=30)  # 原版20，改30
-    for i, row in preview.iterrows():
-        row_values = [str(x).lower() for x in row.tolist()]
-        if any(kw in val for val in row_values for kw in ["account", "description"]):
-            logger.info(f"Data starts at row {i} in {filepath}")
-            return i
-    logger.warning("Could not detect header row, defaulting to row 0")
-    return 0
+NON_DATA_ACCOUNT_WORDS = {
+    "nan",
+    "none",
+    "",
+    "account",
+    "description",
+}
 
 
-# ── 金额清洗 ──────────────────────────────────────────────────────────────────
-# 原注释版：regex处理括号和$，但replace只处理了 '-'、''、'nan'
-# 修复：加 '--'（双短横，Xero有时出现）；同时处理全角字符
-def clean_amount_column(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.strip()
-    s = s.str.replace(r'[\$,]', '', regex=True)
-    s = s.str.replace(r'^\((.+)\)$', r'-\1', regex=True)   # (1234) → -1234
-    s = s.replace({'-': '0', '--': '0', '': '0', 'nan': '0', 'None': '0'})
-    return pd.to_numeric(s, errors='coerce').fillna(0.0)
+@dataclass
+class ReportStructure:
+    account_col: str
+    amount_cols: List[str]
+    current_amount_col: str
 
 
-# ── 单值提取（原注释版没有这个函数）────────────────────────────────────────────
-# 原激活版完全没有提取逻辑，workpaper_builder里的TODO就是因为这里缺失
-def clean_amount(val) -> float:
-    """单个值的清洗，供extract_value用"""
-    s = str(val).strip().replace(",", "").replace("$", "").replace(" ", "")
+# ---------------------------------------------------------------------------
+# Amount cleaning
+# ---------------------------------------------------------------------------
+def clean_amount(value) -> float:
+    if pd.isna(value):
+        return 0.0
+
+    s = str(value).strip()
+    if s.lower() in {"", "nan", "none", "-", "--"}:
+        return 0.0
+
+    is_negative = False
     if s.startswith("(") and s.endswith(")"):
-        s = "-" + s[1:-1]
-    s = s.replace("--", "0").replace("-", "0") if s in ("-", "--") else s
+        is_negative = True
+        s = s[1:-1]
+
+    s = (
+        s.replace("$", "")
+        .replace(",", "")
+        .replace("%", "")
+        .replace(" ", "")
+    )
+
     try:
-        return float(s)
+        number = float(s)
     except ValueError:
         return 0.0
 
+    return -number if is_negative else number
 
-def _detect_amount_col(df: pd.DataFrame) -> str:
-    """扫描列，找第一个数值密度>50%的列"""
-    for col in df.columns[1:]:
-        numeric_count = pd.to_numeric(
-            df[col].astype(str).str.replace(",", "").str.replace("$", ""),
-            errors="coerce"
-        ).notna().sum()
-        if numeric_count > len(df) * 0.5:
+
+def clean_amount_column(series: pd.Series) -> pd.Series:
+    return series.apply(clean_amount)
+
+
+def _numeric_density(series: pd.Series) -> float:
+    if len(series) == 0:
+        return 0.0
+    numeric = series.apply(lambda x: str(x).strip()).apply(
+        lambda x: bool(re.search(r"\d", x)) and clean_amount(x) == clean_amount(x)
+    )
+    return numeric.sum() / len(series)
+
+
+# ---------------------------------------------------------------------------
+# Header / column detection
+# ---------------------------------------------------------------------------
+def find_data_start_row(filepath: str, scan_rows: int = 80) -> int:
+    preview = pd.read_excel(filepath, header=None, nrows=scan_rows)
+
+    best_row = 0
+    best_score = -1
+
+    for i, row in preview.iterrows():
+        values = [str(x).strip().lower() for x in row.tolist()]
+        score = 0
+
+        if any(v in {"account", "description"} for v in values):
+            score += 5
+        if any(re.search(r"20\d{2}|30 june|30 jun|year", v) for v in values):
+            score += 2
+        if sum(1 for v in values if v not in {"", "nan", "none"}) >= 2:
+            score += 1
+
+        if score > best_score:
+            best_score = score
+            best_row = i
+
+        if score >= 6:
+            logger.info("Data header detected at row %s in %s", i, filepath)
+            return i
+
+    logger.warning("Could not confidently detect header row in %s; using row %s", filepath, best_row)
+    return best_row
+
+
+def _normalise_column_names(columns: Iterable) -> List[str]:
+    seen = {}
+    output = []
+    for idx, col in enumerate(columns):
+        name = str(col).strip() if str(col).strip() else f"Column {idx + 1}"
+        if name.lower().startswith("unnamed"):
+            name = f"Column {idx + 1}"
+        count = seen.get(name, 0)
+        seen[name] = count + 1
+        if count:
+            name = f"{name}_{count + 1}"
+        output.append(name)
+    return output
+
+
+def detect_account_col(df: pd.DataFrame) -> str:
+    for col in df.columns:
+        name = str(col).strip().lower()
+        if name in {"account", "description", "account name"}:
             return col
-    logger.warning("Could not detect amount column — using last column")
-    return df.columns[-1]
+
+    # Fallback: choose the first mostly-text column.
+    best_col = df.columns[0]
+    best_text_count = -1
+    for col in df.columns:
+        text_count = df[col].astype(str).str.contains(r"[A-Za-z]", regex=True, na=False).sum()
+        if text_count > best_text_count:
+            best_text_count = text_count
+            best_col = col
+    return best_col
 
 
-def extract_value(df: pd.DataFrame, aliases: list, amount_col: str = None) -> float | None:
-    """
-    按alias列表搜索account name列，返回第一个非零匹配值。
-    找不到返回None（不是0.0），让调用方区分"真零"和"没找到"。
-    """
-    if amount_col is None:
-        amount_col = _detect_amount_col(df)
-    name_col = df.columns[0]
-    for alias in aliases:
-        mask = df[name_col].astype(str).str.lower().str.contains(alias, na=False)
-        matches = df[mask]
-        if not matches.empty:
-            val = clean_amount(matches.iloc[-1][amount_col])  # 取最后一行避开subtotal
-            if val != 0.0:
-                logger.debug(f"extract_value: matched '{alias}' → {val}")
-                return val
-    return None
+def _is_percentage_or_variance_col(col_name: str) -> bool:
+    text = str(col_name).strip().lower()
+    return "%" in text or "variance %" in text or text in {"var %", "variance percentage"}
 
 
-# ── Account名标准化（原注释版已有，直接激活）────────────────────────────────
+def detect_amount_cols(df: pd.DataFrame, account_col: Optional[str] = None) -> List[str]:
+    if account_col is None:
+        account_col = detect_account_col(df)
+
+    amount_cols = []
+    for col in df.columns:
+        if col == account_col:
+            continue
+        if _is_percentage_or_variance_col(str(col)):
+            continue
+
+        cleaned = df[col].apply(clean_amount)
+        raw_has_digits = df[col].astype(str).str.contains(r"\d", regex=True, na=False)
+        numeric_like_count = raw_has_digits.sum()
+        non_zero_count = (cleaned != 0).sum()
+
+        if numeric_like_count >= max(2, len(df) * 0.15) or non_zero_count >= 1:
+            amount_cols.append(col)
+
+    return amount_cols
+
+
+def choose_current_amount_col(df: pd.DataFrame, amount_cols: List[str]) -> str:
+    if not amount_cols:
+        raise ValueError("No amount columns detected in cleaned report.")
+
+    # Prefer first year/date column. Xero exports commonly list current period first.
+    for col in amount_cols:
+        text = str(col).lower()
+        if re.search(r"20\d{2}|30 june|30 jun|year", text) and not re.search(r"variance|budget", text):
+            return col
+
+    return amount_cols[0]
+
+
+def detect_report_structure(df: pd.DataFrame) -> ReportStructure:
+    account_col = detect_account_col(df)
+    amount_cols = detect_amount_cols(df, account_col)
+    current_amount_col = choose_current_amount_col(df, amount_cols)
+    return ReportStructure(account_col, amount_cols, current_amount_col)
+
+
+# Backward-compatible alias for older imports.
+def _detect_amount_col(df: pd.DataFrame) -> str:
+    return detect_report_structure(df).current_amount_col
+
+
+# ---------------------------------------------------------------------------
+# Row cleaning / extraction
+# ---------------------------------------------------------------------------
 def standardise_account_names(series: pd.Series) -> pd.Series:
-    return series.astype(str).str.strip().str.title()
+    def clean_name(value) -> str:
+        if pd.isna(value):
+            return ""
+        text = str(value).replace("\n", " ").strip()
+        text = re.sub(r"\s+", " ", text)
+        return text
+
+    return series.apply(clean_name)
 
 
-# ── 合计行校验（原注释版已有，直接激活）─────────────────────────────────────
-def validate_totals(df: pd.DataFrame, amount_col: str, label: str):
-    total_rows = df[df.iloc[:, 0].astype(str).str.lower().str.startswith("total")]
-    if total_rows.empty:
-        logger.warning(f"{label}: No 'Total' rows found to validate.")
-        return
-    logger.info(f"{label}: Found {len(total_rows)} total row(s) — manual review recommended.")
+def _is_data_row(account_name: str) -> bool:
+    text = str(account_name or "").strip().lower()
+    return text not in NON_DATA_ACCOUNT_WORDS
 
 
-# ── 核心清洗函数（原注释版已有，nrows扫描上限修复后可以激活）──────────────────
+def add_row_type(df: pd.DataFrame, account_col: str) -> pd.DataFrame:
+    out = df.copy()
+
+    def row_type(account_name: str) -> str:
+        text = str(account_name or "").strip().lower()
+        if not text:
+            return "blank"
+        if text.startswith("total") or text in {"gross profit", "net profit", "net assets"}:
+            return "total"
+        if text in {
+            "trading income",
+            "cost of sales",
+            "other income",
+            "operating expenses",
+            "assets",
+            "liabilities",
+            "equity",
+            "current assets",
+            "current liabilities",
+            "non-current assets",
+            "non-current liabilities",
+        }:
+            return "heading"
+        return "account"
+
+    out["Row Type"] = out[account_col].apply(row_type)
+    return out
+
+
 def clean_report(filepath: str, report_label: str) -> pd.DataFrame:
-    logger.info(f"Cleaning {report_label} from {filepath}...")
+    logger.info("Cleaning %s from %s", report_label, filepath)
     start_row = find_data_start_row(filepath)
     df = pd.read_excel(filepath, header=start_row)
+    df.columns = _normalise_column_names(df.columns)
+
     df.dropna(how="all", inplace=True)
     df.dropna(axis=1, how="all", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    first_col = df.columns[0]
-    df[first_col] = standardise_account_names(df[first_col])
-    for col in df.columns[1:]:
+
+    structure = detect_report_structure(df)
+    account_col = structure.account_col
+
+    df[account_col] = standardise_account_names(df[account_col])
+    df = df[df[account_col].apply(_is_data_row)].copy()
+
+    for col in structure.amount_cols:
         df[col] = clean_amount_column(df[col])
-    validate_totals(df, df.columns[1], report_label)
-    logger.info(f"✓ {report_label} cleaned — {len(df)} rows")
+
+    df = add_row_type(df, account_col)
+    logger.info(
+        "%s cleaned: %s rows, account_col=%s, amount_cols=%s, current=%s",
+        report_label,
+        len(df),
+        account_col,
+        structure.amount_cols,
+        structure.current_amount_col,
+    )
     return df
 
 
-# ── 对外接口 ──────────────────────────────────────────────────────────────────
-# 原激活版：load_raw_reports()用header=None原样读入，完全不处理
-# 修复后：load_raw_reports()保持原样（给write_workbook用的raw sheet）
-#         load_clean_reports()走clean_report()，给reconciler和workpaper用
+def extract_value(
+    df: pd.DataFrame,
+    aliases: List[str],
+    amount_col: Optional[str] = None,
+    account_col: Optional[str] = None,
+) -> Optional[float]:
+    """Return matched amount, including a true 0.0. Return None only if not found."""
+    if account_col is None:
+        account_col = detect_account_col(df)
+    if amount_col is None:
+        amount_col = _detect_amount_col(df)
+
+    names = df[account_col].astype(str).str.strip().str.lower()
+
+    for alias in aliases:
+        alias_text = alias.strip().lower()
+        # Prefer exact match, then contains match.
+        exact = df[names == alias_text]
+        matches = exact if not exact.empty else df[names.str.contains(re.escape(alias_text), na=False)]
+
+        if not matches.empty:
+            # Last match usually captures the final total if Xero has subtotals above it.
+            return clean_amount(matches.iloc[-1][amount_col])
+
+    return None
+
+
 def load_raw_reports() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """给write_workbook用 — 保留原始Xero格式，不处理"""
     import os
-    from config import PL_RAW_PATH, BS_RAW_PATH
+
     if not os.path.exists(PL_RAW_PATH):
         raise FileNotFoundError(f"P&L not found: {PL_RAW_PATH}")
     if not os.path.exists(BS_RAW_PATH):
-        raise FileNotFoundError(f"BS not found: {BS_RAW_PATH}")
+        raise FileNotFoundError(f"Balance Sheet not found: {BS_RAW_PATH}")
+
     raw_pl = pd.read_excel(PL_RAW_PATH, header=None)
     raw_bs = pd.read_excel(BS_RAW_PATH, header=None)
-    logger.info(f"Raw P&L: {len(raw_pl)} rows | Raw BS: {len(raw_bs)} rows")
+    logger.info("Raw P&L rows=%s | Raw BS rows=%s", len(raw_pl), len(raw_bs))
     return raw_pl, raw_bs
 
 
 def load_clean_reports() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """给reconciler/workpaper_builder用 — 走完整清洗流程"""
-    pl_df = clean_report(PL_RAW_PATH, "Profit and Loss")
-    bs_df = clean_report(BS_RAW_PATH, "Balance Sheet")
-    return pl_df, bs_df
+    return (
+        clean_report(PL_RAW_PATH, "Profit and Loss"),
+        clean_report(BS_RAW_PATH, "Balance Sheet"),
+    )

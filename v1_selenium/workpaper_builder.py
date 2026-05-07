@@ -1,18 +1,25 @@
 # v1_selenium/workpaper_builder.py
+"""Build accountant-style workpaper data blocks."""
 
 from __future__ import annotations
-from config import TAX_RATE, TAX_ADJUSTMENTS, RD_OFFSET_AMOUNT
 
 from dataclasses import dataclass
 import logging
+import re
 from typing import Any
 
 import pandas as pd
 
 from cleaner import load_clean_reports, clean_amount
-from config import TAX_RATE, TAX_ADJUSTMENTS
-from itr_rules import WORKSHEET_2, validate_adjustment_label
-from labeller import label_report, extract_account_entries, extract_review_items
+from config import (
+    TAX_RATE,
+    TAX_ADJUSTMENTS,
+    CARRY_FORWARD_LOSSES_TEMPLATE,
+    RD_BREAKDOWN_TEMPLATE,
+    RD_OFFSET_AMOUNT,
+)
+from itr_rules import WORKSHEET_2, validate_adjustment_label, get_item7_direction
+from labeller import label_report, extract_review_items
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +31,8 @@ class Workpaper:
     tax_reconciliation: pd.DataFrame
     carry_forward_losses: pd.DataFrame
     rd_breakdown: pd.DataFrame
+    bs_checks: pd.DataFrame
+    review_items: pd.DataFrame
 
 
 def _get_account_col(df: pd.DataFrame) -> str:
@@ -33,8 +42,9 @@ def _get_account_col(df: pd.DataFrame) -> str:
     return df.columns[0]
 
 
-def _detect_amount_cols(df: pd.DataFrame) -> list:
+def _detect_amount_cols(df: pd.DataFrame) -> list[str]:
     helper_cols = {
+        "source row",
         "row type",
         "report section",
         "itr ref",
@@ -43,6 +53,14 @@ def _detect_amount_cols(df: pd.DataFrame) -> list:
         "confidence",
         "review note",
         "label reason",
+        "recon itr ref",
+        "line type",
+        "description",
+        "source",
+        "calculation",
+        "direction",
+        "check",
+        "explanation",
     }
 
     amount_cols = []
@@ -53,32 +71,34 @@ def _detect_amount_cols(df: pd.DataFrame) -> list:
         if lower in helper_cols:
             continue
 
-        if lower in {"account", "description", "account name"}:
+        if lower in {"account", "account name", "description"}:
             continue
 
         if "variance" in lower or "%" in lower:
             continue
 
-        # Common Xero period columns
         if (
             str(col).strip().isdigit()
             or lower.startswith("30 jun")
             or lower.startswith("30 june")
-            or "20" in lower
+            or re.search(r"\b20\d{2}\b", lower)
         ):
             amount_cols.append(col)
 
     return amount_cols
 
 
-def _extract_net_profit_by_period(clean_pl_df: pd.DataFrame) -> dict[str, float]:
-    """
-    Extract Net Profit from original P&L total row.
+def _row_names(df: pd.DataFrame, account_col: str) -> pd.Series:
+    return (
+        df[account_col]
+        .astype(str)
+        .str.replace(r"\s+", " ", regex=True)
+        .str.strip()
+        .str.lower()
+    )
 
-    Important:
-    We do NOT recalculate it.
-    We trust the original Xero report total row.
-    """
+
+def _extract_reported_net_profit(clean_pl_df: pd.DataFrame) -> tuple[dict[str, float], str]:
     account_col = _get_account_col(clean_pl_df)
     amount_cols = _detect_amount_cols(clean_pl_df)
 
@@ -89,128 +109,104 @@ def _extract_net_profit_by_period(clean_pl_df: pd.DataFrame) -> dict[str, float]
     else:
         candidates = clean_pl_df.copy()
 
-    names = candidates[account_col].astype(str).str.strip().str.lower()
+    if candidates.empty:
+        return {str(col): 0.0 for col in amount_cols}, "No total rows found"
+
+    names = _row_names(candidates, account_col)
 
     net_profit_rows = candidates[
-        names.str.fullmatch(r"net profit|net loss|net profit / loss|net profit/\(loss\)", na=False)
-        | names.str.contains(r"\bnet profit\b|\bnet loss\b", regex=True, na=False)
+        names.str.fullmatch(
+            r"net profit|net loss|net profit / loss|net profit/\(loss\)|profit before tax|accounting profit before tax",
+            na=False,
+        )
+        | names.str.contains(
+            r"\bnet profit\b|\bnet loss\b|\bprofit before tax\b|\baccounting profit\b",
+            regex=True,
+            na=False,
+        )
     ]
 
     if net_profit_rows.empty:
-        logger.warning("Could not find Net Profit total row. Falling back to last total row.")
-        total_rows = candidates
-        if "Row Type" in total_rows.columns:
-            total_rows = total_rows[
-                total_rows["Row Type"].astype(str).str.lower().eq("total")
-            ]
+        return {str(col): 0.0 for col in amount_cols}, "Net Profit / Profit Before Tax row not found"
 
-        if total_rows.empty:
-            raise ValueError("Could not extract Net Profit from P&L: no total rows found.")
+    row = net_profit_rows.iloc[-1]
+    return {str(col): clean_amount(row.get(col, 0.0)) for col in amount_cols}, "Reported Xero Net Profit / Profit Before Tax row"
 
-        net_profit_row = total_rows.iloc[-1]
-    else:
-        net_profit_row = net_profit_rows.iloc[-1]
 
-    result = {}
+def _calculate_net_profit_from_sections(clean_pl_df: pd.DataFrame) -> tuple[dict[str, float], str]:
+    account_col = _get_account_col(clean_pl_df)
+    amount_cols = _detect_amount_cols(clean_pl_df)
 
-    for col in amount_cols:
-        result[str(col)] = clean_amount(net_profit_row[col])
+    if "Row Type" not in clean_pl_df.columns or "Report Section" not in clean_pl_df.columns:
+        return {str(col): 0.0 for col in amount_cols}, "Fallback unavailable - missing Row Type or Report Section"
 
-    return result
+    accounts = clean_pl_df[
+        clean_pl_df["Row Type"].astype(str).str.lower().eq("account")
+    ].copy()
+
+    if accounts.empty:
+        return {str(col): 0.0 for col in amount_cols}, "Fallback unavailable - no account rows"
+
+    result = {str(col): 0.0 for col in amount_cols}
+
+    for _, row in accounts.iterrows():
+        section = str(row.get("Report Section", "")).strip().lower()
+
+        if section in {"trading income", "income", "revenue", "other income"}:
+            sign = 1
+        elif section in {"cost of sales", "operating expenses", "expenses"}:
+            sign = -1
+        else:
+            continue
+
+        for col in amount_cols:
+            result[str(col)] += sign * clean_amount(row.get(col, 0.0))
+
+    return result, "Fallback calculated from account rows by P&L section"
+
+
+def _extract_net_profit_by_period(clean_pl_df: pd.DataFrame) -> tuple[dict[str, float], dict[str, str]]:
+    reported, reported_method = _extract_reported_net_profit(clean_pl_df)
+    fallback, fallback_method = _calculate_net_profit_from_sections(clean_pl_df)
+
+    reported_all_zero = all(abs(v) < 0.005 for v in reported.values())
+    fallback_has_values = any(abs(v) > 0.005 for v in fallback.values())
+
+    final = {}
+    methods = {}
+
+    for period, reported_value in reported.items():
+        fallback_value = fallback.get(period, 0.0)
+
+        if reported_all_zero and fallback_has_values:
+            final[period] = fallback_value
+            methods[period] = fallback_method
+        else:
+            final[period] = reported_value
+            methods[period] = reported_method
+
+    return final, methods
 
 
 def _get_adjustment_amount(adj: dict[str, Any], period: str) -> float:
-    """
-    Supports:
-        {"amount": 100}
-    and:
-        {"amounts": {"2026": 100, "2025": 50}}
-    """
     if "amounts" in adj:
         return float(adj.get("amounts", {}).get(period, 0.0))
-
     return float(adj.get("amount", 0.0))
 
 
-def _build_financial_data(labelled_pl: pd.DataFrame, labelled_bs: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build left-side Tax Return Financial Data.
-
-    Only actual accounting entries are included.
-    Yellow headings and total/subtotal rows are excluded.
-    """
-    rows = []
-
-    def append_entries(labelled_df: pd.DataFrame, source: str):
-        if labelled_df is None or labelled_df.empty:
-            return
-
-        entries = extract_account_entries(labelled_df)
-
-        if entries.empty:
-            return
-
-        account_col = _get_account_col(entries)
-        amount_cols = _detect_amount_cols(entries)
-
-        for _, row in entries.iterrows():
-            out = {
-                "Source": source,
-                "Section": row.get("Report Section", ""),
-                "Account": row.get(account_col, ""),
-            }
-
-            for col in amount_cols:
-                out[str(col)] = row.get(col, 0.0)
-
-            out["ITR Ref"] = row.get("ITR Ref", "")
-            out["ITR Label"] = row.get("ITR Label", "")
-            out["Treatment"] = row.get("Treatment", "")
-            out["Confidence"] = row.get("Confidence", "")
-            out["Review Note"] = row.get("Review Note", "")
-
-            rows.append(out)
-
-    append_entries(labelled_pl, "P&L")
-    append_entries(labelled_bs, "BS")
-
-    return pd.DataFrame(rows)
-
-
-def _build_tax_reconciliation(clean_pl_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Build middle Tax Reconciliation block.
-
-    Only:
-    - original P&L Net Profit total row
-    - configured TAX_ADJUSTMENTS
-
-    affect taxable income.
-    """
-    net_profit_by_period = _extract_net_profit_by_period(clean_pl_df)
-    periods = list(net_profit_by_period.keys())
-
-    taxable_income = dict(net_profit_by_period)
-
-    rows = []
-
-    base_row = {
-        "Section": "Base",
-        "Description": "Accounting Profit / (Loss) Before Tax",
-        "ITR Ref": "7T",
-        "Direction": "base",
-        "Source": "Original Xero P&L Net Profit row",
-    }
-
+def _blank_periods(row: dict, periods: list[str]) -> dict:
     for period in periods:
-        base_row[period] = net_profit_by_period[period]
+        row[period] = None
+    return row
 
-    rows.append(base_row)
+
+def _manual_adjustment_rows(periods: list[str]) -> tuple[list[dict], list[dict], dict[str, float], dict[str, float]]:
+    add_rows: list[dict] = []
+    subtract_rows: list[dict] = []
+    total_add_backs = {period: 0.0 for period in periods}
+    total_subtractions = {period: 0.0 for period in periods}
 
     for category, adjustments in TAX_ADJUSTMENTS.items():
-        if not adjustments:
-            continue
-
         rule = WORKSHEET_2.get(category)
 
         if rule is None:
@@ -225,91 +221,128 @@ def _build_tax_reconciliation(clean_pl_df: pd.DataFrame) -> pd.DataFrame:
 
         for adj in adjustments:
             description = adj.get("description", heading)
-            source = adj.get("source", "Manual adjustment")
+            review_note = adj.get("review_note", adj.get("source", "Manual adjustment"))
 
-            row_amounts = {}
+            row = {
+                "Line Type": "detail",
+                "Description": description,
+                "ITR Ref": itr_label,
+                "Review note": review_note,
+            }
+
             has_amount = False
 
             for period in periods:
-                amount = _get_adjustment_amount(adj, period)
-                row_amounts[period] = amount
+                amount = abs(_get_adjustment_amount(adj, period))
+                row[period] = amount
 
-                if amount != 0:
+                if abs(amount) > 0.005:
                     has_amount = True
+
+                if direction == "add":
+                    total_add_backs[period] += amount
+                elif direction == "subtract":
+                    total_subtractions[period] += amount
 
             if not has_amount:
                 continue
 
-            row = {
-                "Section": "Add back" if direction == "add" else "Subtract",
-                "Description": description,
-                "ITR Ref": itr_label,
-                "Direction": direction,
-                "Source": source,
-            }
+            if direction == "add":
+                add_rows.append(row)
+            elif direction == "subtract":
+                subtract_rows.append(row)
 
-            for period in periods:
-                amount = row_amounts[period]
-                row[period] = amount
-
-                if direction == "add":
-                    taxable_income[period] += amount
-                elif direction == "subtract":
-                    taxable_income[period] -= amount
-
-            rows.append(row)
-
-    taxable_row = {
-        "Section": "Result",
-        "Description": "Taxable Income / (Loss)",
-        "ITR Ref": "",
-        "Direction": "calculated",
-        "Source": "Accounting profit plus add-backs less deductions",
-    }
-
-    for period in periods:
-        taxable_row[period] = taxable_income[period]
-
-    rows.append(taxable_row)
-
-    tax_row = {
-        "Section": "Result",
-        "Description": f"Estimated Tax Payable at {TAX_RATE:.0%}",
-        "ITR Ref": "",
-        "Direction": "calculated",
-        "Source": "Tax rate from config.py",
-    }
-
-    for period in periods:
-        tax_row[period] = max(taxable_income[period], 0.0) * TAX_RATE
-
-    rows.append(tax_row)
-
-    return pd.DataFrame(rows)
+    return add_rows, subtract_rows, total_add_backs, total_subtractions
 
 
-def _build_tax_reconciliation(clean_pl_df: pd.DataFrame) -> pd.DataFrame:
+def _auto_reconciliation_rows_from_labelled_pl(
+    labelled_pl: pd.DataFrame,
+    periods: list[str],
+) -> tuple[list[dict], list[dict], dict[str, float], dict[str, float]]:
     """
-    Build middle Tax Reconciliation block.
+    Convert labelled P&L account rows into tax reconciliation detail rows.
 
-    Only:
-    - original P&L Net Profit total row
-    - configured TAX_ADJUSTMENTS
-
-    affect taxable income.
+    Only rows with Recon ITR Ref are posted.
+    Regular labels like 6C, 6A, 8R, BS do not affect taxable income.
+    Ambiguous review labels stay as review notes unless a rule explicitly sets Recon ITR Ref.
     """
-    net_profit_by_period = _extract_net_profit_by_period(clean_pl_df)
+    add_rows: list[dict] = []
+    subtract_rows: list[dict] = []
+    total_add_backs = {period: 0.0 for period in periods}
+    total_subtractions = {period: 0.0 for period in periods}
+
+    if labelled_pl is None or labelled_pl.empty:
+        return add_rows, subtract_rows, total_add_backs, total_subtractions
+
+    account_col = _get_account_col(labelled_pl)
+
+    rows = labelled_pl[
+        labelled_pl.get("Row Type", "").astype(str).str.lower().eq("account")
+    ].copy()
+
+    for _, row in rows.iterrows():
+        recon_ref = str(row.get("Recon ITR Ref", "") or "").strip()
+
+        if not recon_ref:
+            continue
+
+        validate_adjustment_label(recon_ref, str(row.get(account_col, "")))
+        direction = get_item7_direction(recon_ref)
+
+        if direction not in {"add", "subtract"}:
+            continue
+
+        description = str(row.get(account_col, "") or "").strip()
+        label_reason = str(row.get("Label Reason", "") or "").strip()
+        review_note = str(row.get("Review Note", "") or "").strip()
+
+        combined_note = review_note
+        if label_reason:
+            combined_note = f"{review_note} {label_reason}".strip()
+
+        output_row = {
+            "Line Type": "detail",
+            "Description": description,
+            "ITR Ref": recon_ref,
+            "Review note": combined_note,
+        }
+
+        has_amount = False
+
+        for period in periods:
+            amount = abs(clean_amount(row.get(period, 0.0)))
+            output_row[period] = amount
+
+            if abs(amount) > 0.005:
+                has_amount = True
+
+            if direction == "add":
+                total_add_backs[period] += amount
+            elif direction == "subtract":
+                total_subtractions[period] += amount
+
+        if not has_amount:
+            continue
+
+        if direction == "add":
+            add_rows.append(output_row)
+        elif direction == "subtract":
+            subtract_rows.append(output_row)
+
+    return add_rows, subtract_rows, total_add_backs, total_subtractions
+
+
+def _build_tax_reconciliation(clean_pl_df: pd.DataFrame, labelled_pl: pd.DataFrame) -> pd.DataFrame:
+    net_profit_by_period, net_profit_methods = _extract_net_profit_by_period(clean_pl_df)
     periods = list(net_profit_by_period.keys())
 
-    taxable_income = dict(net_profit_by_period)
-    rows = []
+    rows: list[dict] = []
 
     base_row = {
-        "Section": "Base",
-        "Description": "Accounting Profit / (Loss) Before Tax",
+        "Line Type": "result",
+        "Description": "Accounting Profit Before Tax",
         "ITR Ref": "7T",
-        "Direction": "base",
-        "Source": "Original Xero P&L Net Profit row",
+        "Review note": "",
     }
 
     for period in periods:
@@ -317,64 +350,94 @@ def _build_tax_reconciliation(clean_pl_df: pd.DataFrame) -> pd.DataFrame:
 
     rows.append(base_row)
 
-    for category, adjustments in TAX_ADJUSTMENTS.items():
-        if not adjustments:
-            continue
+    auto_add_rows, auto_subtract_rows, auto_add_totals, auto_subtract_totals = _auto_reconciliation_rows_from_labelled_pl(
+        labelled_pl,
+        periods,
+    )
 
-        rule = WORKSHEET_2.get(category)
+    manual_add_rows, manual_subtract_rows, manual_add_totals, manual_subtract_totals = _manual_adjustment_rows(periods)
 
-        if rule is None:
-            logger.warning("Unknown tax adjustment category skipped: %s", category)
-            continue
+    add_rows = auto_add_rows + manual_add_rows
+    subtract_rows = auto_subtract_rows + manual_subtract_rows
 
-        itr_label = rule["label"]
-        direction = rule["direction"]
-        heading = rule["heading"]
+    total_add_backs = {
+        period: auto_add_totals[period] + manual_add_totals[period]
+        for period in periods
+    }
 
-        validate_adjustment_label(itr_label, heading)
+    total_subtractions = {
+        period: auto_subtract_totals[period] + manual_subtract_totals[period]
+        for period in periods
+    }
 
-        for adj in adjustments:
-            description = adj.get("description", heading)
-            source = adj.get("source", "Manual adjustment")
+    taxable_income = {
+        period: net_profit_by_period[period] + total_add_backs[period] - total_subtractions[period]
+        for period in periods
+    }
 
-            row_amounts = {}
-            has_amount = False
+    rows.append(_blank_periods({
+        "Line Type": "heading",
+        "Description": "Add back",
+        "ITR Ref": "",
+        "Review note": "",
+    }, periods))
 
-            for period in periods:
-                amount = _get_adjustment_amount(adj, period)
-                row_amounts[period] = amount
+    if add_rows:
+        rows.extend(add_rows)
+    else:
+        rows.append(_blank_periods({
+            "Line Type": "placeholder",
+            "Description": "No add-back entries identified",
+            "ITR Ref": "",
+            "Review note": "Add rules via Recon ITR Ref or TAX_ADJUSTMENTS.",
+        }, periods))
 
-                if amount != 0:
-                    has_amount = True
+    total_add_back_row = {
+        "Line Type": "subtotal",
+        "Description": "Total add backs",
+        "ITR Ref": "",
+        "Review note": "",
+    }
 
-            if not has_amount:
-                continue
+    for period in periods:
+        total_add_back_row[period] = total_add_backs[period]
 
-            row = {
-                "Section": "Add back" if direction == "add" else "Subtract",
-                "Description": description,
-                "ITR Ref": itr_label,
-                "Direction": direction,
-                "Source": source,
-            }
+    rows.append(total_add_back_row)
 
-            for period in periods:
-                amount = row_amounts[period]
-                row[period] = amount
+    rows.append(_blank_periods({
+        "Line Type": "heading",
+        "Description": "Subtract",
+        "ITR Ref": "",
+        "Review note": "",
+    }, periods))
 
-                if direction == "add":
-                    taxable_income[period] += amount
-                elif direction == "subtract":
-                    taxable_income[period] -= amount
+    if subtract_rows:
+        rows.extend(subtract_rows)
+    else:
+        rows.append(_blank_periods({
+            "Line Type": "placeholder",
+            "Description": "No subtraction entries identified",
+            "ITR Ref": "",
+            "Review note": "Add rules via Recon ITR Ref or TAX_ADJUSTMENTS.",
+        }, periods))
 
-            rows.append(row)
+    total_subtract_row = {
+        "Line Type": "subtotal",
+        "Description": "Total subtractions",
+        "ITR Ref": "",
+        "Review note": "",
+    }
+
+    for period in periods:
+        total_subtract_row[period] = total_subtractions[period]
+
+    rows.append(total_subtract_row)
 
     taxable_row = {
-        "Section": "Result",
-        "Description": "Taxable Income / (Loss)",
+        "Line Type": "result",
+        "Description": "Taxable Income",
         "ITR Ref": "",
-        "Direction": "calculated",
-        "Source": "Accounting profit plus add-backs less deductions",
+        "Review note": "",
     }
 
     for period in periods:
@@ -383,11 +446,10 @@ def _build_tax_reconciliation(clean_pl_df: pd.DataFrame) -> pd.DataFrame:
     rows.append(taxable_row)
 
     tax_row = {
-        "Section": "Result",
+        "Line Type": "detail",
         "Description": f"Tax Payable at {TAX_RATE:.0%}",
         "ITR Ref": "",
-        "Direction": "calculated",
-        "Source": "Tax rate from config.py",
+        "Review note": "",
     }
 
     tax_payable_by_period = {}
@@ -400,19 +462,17 @@ def _build_tax_reconciliation(clean_pl_df: pd.DataFrame) -> pd.DataFrame:
     rows.append(tax_row)
 
     rd_offset_row = {
-        "Section": "Result",
+        "Line Type": "detail",
         "Description": "R&D offset",
         "ITR Ref": "",
-        "Direction": "manual",
-        "Source": "Manual / R&D schedule input only",
+        "Review note": "Manual input only.",
     }
 
     final_tax_row = {
-        "Section": "Result",
+        "Line Type": "result",
         "Description": "Tax Payable / (Refund due)",
         "ITR Ref": "",
-        "Direction": "calculated",
-        "Source": "Tax payable less R&D offset, if provided",
+        "Review note": "",
     }
 
     for period in periods:
@@ -428,46 +488,115 @@ def _build_tax_reconciliation(clean_pl_df: pd.DataFrame) -> pd.DataFrame:
     rows.append(rd_offset_row)
     rows.append(final_tax_row)
 
-    return pd.DataFrame(rows)
+    method_row = {
+        "Line Type": "note",
+        "Description": "Accounting profit extraction note",
+        "ITR Ref": "",
+        "Review note": "",
+    }
 
-def _build_review_items(labelled_pl: pd.DataFrame, labelled_bs: pd.DataFrame) -> pd.DataFrame:
-    pl_review = extract_review_items(labelled_pl, "P&L")
-    bs_review = extract_review_items(labelled_bs, "BS")
+    for period in periods:
+        method_row[period] = net_profit_methods.get(period, "")
 
-    frames = [df for df in [pl_review, bs_review] if df is not None and not df.empty]
+    rows.append(method_row)
 
-    if not frames:
-        return pd.DataFrame(columns=[
-            "Source",
-            "Section",
-            "Account",
-            "ITR Ref",
-            "ITR Label",
-            "Treatment",
-            "Review Note",
-            "Reason",
-        ])
+    ordered_cols = ["Line Type", "Description"] + periods + ["ITR Ref", "Review note"]
 
-    return pd.concat(frames, ignore_index=True)
+    return pd.DataFrame(rows)[ordered_cols]
 
+
+def _extract_total_by_period(clean_df: pd.DataFrame, aliases: list[str], prefer_total: bool = True) -> dict[str, float]:
+    account_col = _get_account_col(clean_df)
+    amount_cols = _detect_amount_cols(clean_df)
+
+    search_df = clean_df.copy()
+
+    if prefer_total and "Row Type" in search_df.columns:
+        total_df = search_df[
+            search_df["Row Type"].astype(str).str.lower().eq("total")
+        ].copy()
+
+        if not total_df.empty:
+            search_df = total_df
+
+    names = _row_names(search_df, account_col)
+    matched = pd.DataFrame()
+
+    for alias in aliases:
+        alias_text = alias.strip().lower()
+
+        exact = search_df[names.eq(alias_text)]
+        contains = search_df[names.str.contains(re.escape(alias_text), regex=True, na=False)]
+
+        if not exact.empty:
+            matched = exact
+            break
+
+        if not contains.empty:
+            matched = contains
+            break
+
+    if matched.empty:
+        return {str(col): 0.0 for col in amount_cols}
+
+    row = matched.iloc[-1]
+    return {str(col): clean_amount(row.get(col, 0.0)) for col in amount_cols}
+
+
+def _build_bs_checks(clean_bs_df: pd.DataFrame) -> pd.DataFrame:
+    amount_cols = [str(col) for col in _detect_amount_cols(clean_bs_df)]
+
+    total_assets = _extract_total_by_period(clean_bs_df, ["total assets"])
+    total_liabilities = _extract_total_by_period(clean_bs_df, ["total liabilities"])
+    total_equity = _extract_total_by_period(clean_bs_df, ["total equity"])
+    net_assets = _extract_total_by_period(clean_bs_df, ["net assets"])
+
+    equity_variance = {
+        "Check": "TEST CHECK equity variance",
+        "Calculation": "Total Assets - Total Liabilities - Total Equity",
+    }
+
+    net_assets_variance = {
+        "Check": "TEST CHECK net assets variance",
+        "Calculation": "Net Assets - (Total Assets - Total Liabilities)",
+    }
+
+    for period in amount_cols:
+        equity_variance[period] = round(
+            total_assets.get(period, 0.0)
+            - total_liabilities.get(period, 0.0)
+            - total_equity.get(period, 0.0),
+            2,
+        )
+
+        net_assets_variance[period] = round(
+            net_assets.get(period, 0.0)
+            - (total_assets.get(period, 0.0) - total_liabilities.get(period, 0.0)),
+            2,
+        )
+
+    return pd.DataFrame([equity_variance, net_assets_variance])
 
 
 def build_workpaper() -> Workpaper:
-    """
-    Build accountant-style workpaper data blocks.
-
-    Raw PL / BS sheets are copied directly in write_workbook.py.
-    This function only prepares labels and generated schedules.
-    """
     clean_pl_df, clean_bs_df = load_clean_reports()
 
     labelled_pl = label_report(clean_pl_df, "profit_and_loss")
     labelled_bs = label_report(clean_bs_df, "balance_sheet")
 
-    tax_reconciliation = _build_tax_reconciliation(clean_pl_df)
+    tax_reconciliation = _build_tax_reconciliation(clean_pl_df, labelled_pl)
+    bs_checks = _build_bs_checks(clean_bs_df)
 
     carry_forward_losses = pd.DataFrame(CARRY_FORWARD_LOSSES_TEMPLATE)
     rd_breakdown = pd.DataFrame(RD_BREAKDOWN_TEMPLATE)
+
+    review_items = pd.concat(
+        [
+            extract_review_items(labelled_pl, "P&L"),
+            extract_review_items(labelled_bs, "BS"),
+        ],
+        ignore_index=True,
+    )
 
     return Workpaper(
         labelled_pl=labelled_pl,
@@ -475,12 +604,6 @@ def build_workpaper() -> Workpaper:
         tax_reconciliation=tax_reconciliation,
         carry_forward_losses=carry_forward_losses,
         rd_breakdown=rd_breakdown,
+        bs_checks=bs_checks,
+        review_items=review_items,
     )
-
-from config import (
-    TAX_RATE,
-    TAX_ADJUSTMENTS,
-    CARRY_FORWARD_LOSSES_TEMPLATE,
-    RD_BREAKDOWN_TEMPLATE,
-    RD_OFFSET_AMOUNT,
-)

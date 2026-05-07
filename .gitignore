@@ -1,5 +1,6 @@
 # Environment & secrets
 .env
+interesting_spots.md
 
 # Raw downloaded data and outputs (financial data — never commit)
 v1_selenium/data/

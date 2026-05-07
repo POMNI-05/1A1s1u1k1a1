@@ -1,46 +1,34 @@
 # v1_selenium/main.py
-
 from __future__ import annotations
 
 import logging
 
-from utils import setup_logging, ensure_dirs
-from config import USE_SELENIUM, OUTPUT_PATH
 from cleaner import load_raw_reports
+from config import OUTPUT_PATH, USE_SELENIUM
+from utils import ensure_dirs, setup_logging
 from workpaper_builder import build_workpaper
 from write_workbook import write_workbook
-
-setup_logging()
-ensure_dirs()
 
 logger = logging.getLogger(__name__)
 
 
-def run():
-    logger.info("=" * 60)
-    logger.info("Xero Automation Pipeline - Starting")
-    logger.info("=" * 60)
+def run() -> None:
+    setup_logging()
+    ensure_dirs()
+    logger.info("Xero workpaper pipeline starting")
 
     if USE_SELENIUM:
-        logger.info("STEP 0 - Downloading reports from Xero")
+        logger.info("Downloading Xero reports")
         from downloader import download_report
         download_report("PL")
         download_report("BS")
     else:
-        logger.info("STEP 0 - Using local Excel files")
+        logger.info("Using local Excel exports in data/")
 
-    logger.info("STEP 1 - Loading raw Xero reports")
     raw_pl_df, raw_bs_df = load_raw_reports()
-
-    logger.info("STEP 2 - Building accountant-style tax workpaper")
     workpaper = build_workpaper()
-
-    logger.info("STEP 3 - Writing final workbook")
     write_workbook(raw_pl_df, raw_bs_df, workpaper)
-
-    logger.info("=" * 60)
-    logger.info("Pipeline complete. Output: %s", OUTPUT_PATH)
-    logger.info("=" * 60)
+    logger.info("Pipeline complete: %s", OUTPUT_PATH)
 
 
 if __name__ == "__main__":

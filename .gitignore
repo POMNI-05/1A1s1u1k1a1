@@ -3,9 +3,9 @@
 interesting_spots.md
 
 # Raw downloaded data and outputs (financial data — never commit)
-v1_selenium/data/
-v1_selenium/output/
-v1_selenium/logs/
+v1/data/
+v1/output/
+v1/logs/
 v2_api/data/
 v2_api/output/
 v2_api/logs/

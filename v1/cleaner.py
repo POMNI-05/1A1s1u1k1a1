@@ -1,15 +1,14 @@
-# v1_selenium/cleaner.py
+# v1/cleaner.py 
 """Parse/chunk Xero P&L and Balance Sheet exports without changing evidence."""
 from __future__ import annotations
 
 import logging
 import re
+import pandas as pd
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
-
-import pandas as pd
-
 from config import BS_RAW_PATH, PL_RAW_PATH
 
 logger = logging.getLogger(__name__)
@@ -18,6 +17,7 @@ NET_PROFIT_ALIASES = [
     "net profit", "net loss", "net profit / loss", "net profit/(loss)",
     "profit before tax", "accounting profit before tax", "profit (loss)",
 ]
+
 TOTAL_ASSETS_ALIASES = ["total assets"]
 TOTAL_LIABILITIES_ALIASES = ["total liabilities"]
 TOTAL_EQUITY_ALIASES = ["total equity"]

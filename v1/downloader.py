@@ -1,9 +1,13 @@
-# v1_selenium/downloader.py
+# v1/downloader.py
 """
 Selenium download layer for V1.
 
-Keep this file only responsible for Xero UI download. Cleaning, tax logic and
-workbook construction should remain in cleaner.py / workpaper_builder.py.
+Keep this file only responsible for Xero UI download. 
+Cleaning, tax logic and workbook construction should 
+    remain in cleaner.py / workpaper_builder.py.
+
+Comment: give up on trying to abstract the selenium layer, 
+    Xero's UI is too volatile and brittle for that to be effective.
 """
 
 from __future__ import annotations

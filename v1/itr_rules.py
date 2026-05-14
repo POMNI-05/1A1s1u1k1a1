@@ -1,4 +1,4 @@
-# v1_selenium/itr_rules.py
+# v1/itr_rules.py
 """Account labelling and Item 7 tax-workpaper rule metadata."""
 
 from __future__ import annotations

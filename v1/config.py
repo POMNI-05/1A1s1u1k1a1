@@ -1,4 +1,4 @@
-# v1_selenium/config.py
+# v1/config.py
 """
 Central configuration for the Xero workpaper pipeline.
 
@@ -9,9 +9,7 @@ Design rule:
 - TAX_ADJUSTMENTS contains actual tax reconciliation amounts after review.
 """
 from __future__ import annotations
-
 import os
-
 from itr_rules import TAX_RATES, RD_OFFSET_RATES, SMALL_BUSINESS_THRESHOLDS
 
 # ---------------------------------------------------------------------------
@@ -32,7 +30,7 @@ SHEET_BS_RAW = "Xero BS Raw"
 SHEET_RECONCILIATION = "Tax Reconciliation"
 
 # ---------------------------------------------------------------------------
-# Selenium settings
+# Selenium settings (if using Selenium for download)
 # ---------------------------------------------------------------------------
 USE_SELENIUM = os.getenv("USE_SELENIUM", "false").lower() == "true"
 HEADLESS = os.getenv("HEADLESS", "false").lower() == "true"
@@ -90,19 +88,12 @@ TAX_ADJUSTMENTS = {
 }
 
 # # Optional support schedules for the right-hand side of the workpaper.
-# # These are display/support only unless you also put amounts into TAX_ADJUSTMENTS.
+# These are display/support only unless you also put amounts into TAX_ADJUSTMENTS.
 # CARRY_FORWARD_LOSSES = []
-# # Example:
-# # CARRY_FORWARD_LOSSES = [
-# #     {"year": "30-Jun-2024", "amount": 1032617.00, "used": 0.00, "source": "Prior year return"},
-# # ]
-
-# RD_BREAKDOWN = {
-#     "eligible_spend": 0.0,
-#     "expensed": 0.0,
-#     "capitalised": 0.0,
-#     "source": "Not provided",
-# }
+    # Example:
+    # CARRY_FORWARD_LOSSES = [
+    #     {"year": "30-Jun-2024", "amount": 1032617.00, "used": 0.00, "source": "Prior year return"},
+    # ]
 
 CARRY_FORWARD_LOSSES_TEMPLATE = [
     {"Description": "30-Jun-21", "Amount": None},
@@ -111,6 +102,13 @@ CARRY_FORWARD_LOSSES_TEMPLATE = [
     {"Description": "30-Jun-24", "Amount": None},
     {"Description": "Total Losses", "Amount": None},
 ]
+
+# RD_BREAKDOWN = {
+#     "eligible_spend": 0.0,
+#     "expensed": 0.0,
+#     "capitalised": 0.0,
+#     "source": "Not provided",
+# }
 
 RD_BREAKDOWN_TEMPLATE = [
     {"Description": "Eligible Spend", "Amount": None},

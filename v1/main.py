@@ -1,4 +1,27 @@
-# v1_selenium/main.py
+# v1/main.py
+## Overview of main.py:
+"""
+main.py
+  ├─ utils.setup_logging(), ensure_dirs()
+  ├─ if USE_SELENIUM:
+  │     └─ downloader.download_report("PL"), download_report("BS")
+  ├─ cleaner.load_raw_reports()
+  ├─ workpaper_builder.build_workpaper()
+  │     ├─ cleaner.load_clean_reports()
+  │     ├─ labeller.label_report(PL)
+  │     │     └─ itr_rules.match_financial_label()
+  │     ├─ labeller.label_report(BS)
+  │     │     └─ itr_rules.match_financial_label()
+  │     ├─ build tax reconciliation
+  │     ├─ build BS checks
+  │     └─ build review/support tables
+  └─ write_workbook.write_workbook()
+        ├─ copy raw Xero sheets
+        ├─ write side labels
+        ├─ write tax reconciliation
+        ├─ write support schedules
+        └─ save xero_workpaper.xlsx
+"""
 from __future__ import annotations
 
 import logging

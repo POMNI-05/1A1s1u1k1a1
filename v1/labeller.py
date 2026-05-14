@@ -1,4 +1,4 @@
-# v1_selenium/labeller.py
+# v1/labeller.py
 """Label only actual accounting entries; keep headings/totals as structure/check rows."""
 
 from __future__ import annotations

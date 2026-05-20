@@ -1,5 +1,15 @@
 # v1/write_workbook.py
-"""Write the final Excel workbook while preserving raw Xero evidence sheets."""
+"""Write the final Excel workbook while preserving raw report evidence values.
+
+This writer is input-source flexible:
+- P&L and BS may come from separate workbooks;
+- or from different sheets in one combined workbook.
+
+Note:
+- This version preserves raw values, not original Excel styling/formulas.
+- If exact source styling/formulas must be preserved, use source_path + sheet_name
+  metadata from cleaner.ReportInput and copy with openpyxl from the original sheet.
+"""
 
 from __future__ import annotations
 
@@ -14,10 +24,10 @@ from openpyxl.formula.translate import Translator
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
+from cleaner import ReportInput
+
 from config import (
-    BS_RAW_PATH,
     OUTPUT_PATH,
-    PL_RAW_PATH,
     SHEET_BS_RAW,
     SHEET_PL_RAW,
     SHEET_RECONCILIATION,
@@ -32,11 +42,12 @@ REVIEW_FILL = PatternFill("solid", fgColor="FFF2CC")
 RESULT_FILL = PatternFill("solid", fgColor="D9E2F3")
 INPUT_FILL = PatternFill("solid", fgColor="E2F0D9")
 
-RED_FONT = Font(color="FF0000", bold=True, size=12)
-TITLE_FONT = Font(bold=True, size=12)
-HEADER_FONT = Font(bold=True, size=12)
-BOLD_FONT = Font(bold=True, size=12)
-NOTE_FONT = Font(italic=True, color="666666", size=12)
+RED_FONT = Font(color="FF0000", bold=True, size=9)
+TITLE_FONT = Font(bold=True, size=9)
+HEADER_FONT = Font(bold=True, size=9)
+BOLD_FONT = Font(bold=True, size=9)
+NOTE_FONT = Font(italic=True, color="666666", size=9)
+REVIEW_NOTE_FONT = Font(size=9)
 
 THIN_BORDER = Border(bottom=Side(style="thin", color="BFBFBF"))
 THICK_BORDER = Border(bottom=Side(style="medium", color="000000"))
@@ -68,6 +79,59 @@ def _force_font_size_9(ws) -> None:
             cell.font = _font_with_size(cell.font, 9)
 
 
+def _safe(value):
+    return None if pd.isna(value) else value
+
+
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _write_raw_df_to_sheet(wb: Workbook, raw_df: pd.DataFrame, title: str):
+    ws = wb.create_sheet(title)
+    for r_idx, row in enumerate(raw_df.itertuples(index=False, name=None), start=1):
+        for c_idx, value in enumerate(row, start=1):
+            ws.cell(r_idx, c_idx, _safe(value))
+
+    for col_idx in range(1, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 14
+
+    return ws
+
+
+def _copy_raw_df_area(
+    raw_df: pd.DataFrame,
+    dst_ws,
+    start_row: int,
+    start_col: int,
+) -> tuple[int, int]:
+    for r_idx, row in enumerate(raw_df.itertuples(index=False, name=None), start=start_row):
+        for c_idx, value in enumerate(row, start=start_col):
+            dst_ws.cell(r_idx, c_idx, _safe(value))
+
+    last_row = start_row + max(len(raw_df), 1) - 1
+    last_col = start_col + max(len(raw_df.columns), 1) - 1
+
+    for col_idx in range(start_col, last_col + 1):
+        dst_ws.column_dimensions[get_column_letter(col_idx)].width = 14
+
+    return last_row, last_col
+
+def _get_source_ws(report_input: ReportInput):
+    src_wb = load_workbook(report_input.source_path, data_only=False)
+
+    if report_input.sheet_name in src_wb.sheetnames:
+        return src_wb, src_wb[report_input.sheet_name]
+
+    try:
+        idx = int(report_input.sheet_name)
+        return src_wb, src_wb.worksheets[idx]
+    except Exception as exc:
+        raise KeyError(
+            f"Could not find sheet {report_input.sheet_name!r} in {report_input.source_path}"
+        ) from exc
+
+
 def _copy_style(src, dst) -> None:
     if src.has_style:
         dst.font = copy.copy(src.font)
@@ -82,82 +146,104 @@ def _copy_cell(src, dst) -> None:
     dst.value = src.value
     _copy_style(src, dst)
 
+    if src.hyperlink:
+        dst._hyperlink = copy.copy(src.hyperlink)
 
-def _copy_sheet_to_workbook(src_path: str | Path, dst_wb: Workbook, title: str):
-    src_wb = load_workbook(src_path, data_only=False)
-    src_ws = src_wb.worksheets[0]
+    if src.comment:
+        dst.comment = copy.copy(src.comment)
+
+
+def _copy_cell_translated(src, dst, copy_formulas: bool = True) -> None:
+    if copy_formulas and isinstance(src.value, str) and src.value.startswith("="):
+        dst.value = Translator(
+            src.value,
+            origin=src.coordinate,
+        ).translate_formula(dst.coordinate)
+    else:
+        dst.value = src.value
+
+    _copy_style(src, dst)
+
+    if src.hyperlink:
+        dst._hyperlink = copy.copy(src.hyperlink)
+
+    if src.comment:
+        dst.comment = copy.copy(src.comment)
+
+
+def _copy_merged_ranges(src_ws, dst_ws, row_offset: int = 0, col_offset: int = 0) -> None:
+    for merged_range in src_ws.merged_cells.ranges:
+        min_col, min_row, max_col, max_row = merged_range.bounds
+
+        dst_ws.merge_cells(
+            start_row=min_row + row_offset,
+            start_column=min_col + col_offset,
+            end_row=max_row + row_offset,
+            end_column=max_col + col_offset,
+        )
+
+
+def _copy_sheet_to_workbook(report_input: ReportInput, dst_wb: Workbook, title: str):
+    """Copy selected original source sheet into output workbook."""
+    _, src_ws = _get_source_ws(report_input)
     dst_ws = dst_wb.create_sheet(title)
 
     for row in src_ws.iter_rows():
         for src_cell in row:
-            _copy_cell(src_cell, dst_ws.cell(src_cell.row, src_cell.column))
+            dst_cell = dst_ws.cell(src_cell.row, src_cell.column)
+            _copy_cell(src_cell, dst_cell)
 
     for col_letter, dim in src_ws.column_dimensions.items():
         dst_ws.column_dimensions[col_letter].width = dim.width
 
     for row_idx, dim in src_ws.row_dimensions.items():
-        dst_ws.row_dimensions[row_idx].height = dim.height
+        if dim.height is not None:
+            dst_ws.row_dimensions[row_idx].height = dim.height
 
-    for merged_range in src_ws.merged_cells.ranges:
-        dst_ws.merge_cells(str(merged_range))
+    _copy_merged_ranges(src_ws, dst_ws)
+
+    dst_ws.freeze_panes = src_ws.freeze_panes
+    dst_ws.sheet_view.showGridLines = src_ws.sheet_view.showGridLines
 
     return dst_ws
 
 
 def _copy_report_area(
-    src_path: str | Path,
+    report_input: ReportInput,
     dst_ws,
     start_row: int,
     start_col: int,
     copy_formulas: bool = True,
 ) -> tuple[int, int]:
-    src_wb = load_workbook(src_path, data_only=False)
-    src_ws = src_wb.worksheets[0]
+    """Copy selected original report sheet into the reconciliation sheet."""
+    _, src_ws = _get_source_ws(report_input)
+
+    row_offset = start_row - 1
+    col_offset = start_col - 1
 
     for row in src_ws.iter_rows():
         for src_cell in row:
             dst_cell = dst_ws.cell(
-                start_row + src_cell.row - 1,
-                start_col + src_cell.column - 1,
+                row=start_row + src_cell.row - 1,
+                column=start_col + src_cell.column - 1,
             )
-
-            if copy_formulas and isinstance(src_cell.value, str) and src_cell.value.startswith("="):
-                dst_cell.value = Translator(
-                    src_cell.value,
-                    origin=src_cell.coordinate,
-                ).translate_formula(dst_cell.coordinate)
-            else:
-                dst_cell.value = src_cell.value
-
-            _copy_style(src_cell, dst_cell)
+            _copy_cell_translated(src_cell, dst_cell, copy_formulas=copy_formulas)
 
     for col_idx in range(1, src_ws.max_column + 1):
         src_letter = get_column_letter(col_idx)
         dst_letter = get_column_letter(start_col + col_idx - 1)
-        dst_ws.column_dimensions[dst_letter].width = src_ws.column_dimensions[src_letter].width or 12
-
-    for row_idx, dim in src_ws.row_dimensions.items():
-        dst_ws.row_dimensions[start_row + row_idx - 1].height = dim.height
-
-    for merged_range in src_ws.merged_cells.ranges:
-        min_col, min_row, max_col, max_row = merged_range.bounds
-        dst_ws.merge_cells(
-            start_row=start_row + min_row - 1,
-            start_column=start_col + min_col - 1,
-            end_row=start_row + max_row - 1,
-            end_column=start_col + max_col - 1,
+        dst_ws.column_dimensions[dst_letter].width = (
+            src_ws.column_dimensions[src_letter].width or 12
         )
 
+    # Preserve source row heights only. Do not auto-resize row height.
+    for row_idx, dim in src_ws.row_dimensions.items():
+        if dim.height is not None:
+            dst_ws.row_dimensions[start_row + row_idx - 1].height = dim.height
+
+    _copy_merged_ranges(src_ws, dst_ws, row_offset=row_offset, col_offset=col_offset)
+
     return start_row + src_ws.max_row - 1, start_col + src_ws.max_column - 1
-
-
-def _safe(value):
-    return None if pd.isna(value) else value
-
-
-def _is_number(value) -> bool:
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
-
 
 def _write_side_labels(
     ws,
@@ -172,7 +258,7 @@ def _write_side_labels(
     for cell in (ws.cell(source_start_row, itr_col), ws.cell(source_start_row, review_col)):
         cell.font = RED_FONT
         cell.fill = HEADER_FILL
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=False)
 
     for _, row in labelled_df.iterrows():
         source_row = row.get("Source Row")
@@ -189,6 +275,13 @@ def _write_side_labels(
         label_reason = str(row.get("Label Reason", "") or "").strip()
         confidence = str(row.get("Confidence", "") or "").lower()
 
+        treatment = str(row.get("Treatment", "") or "").lower()
+        if not itr_ref and treatment == "support_only":
+            continue
+        
+        if not itr_ref and confidence not in {"medium", "low"}:
+            continue
+
         if not itr_ref and not review_note and not label_reason:
             continue
 
@@ -200,6 +293,7 @@ def _write_side_labels(
 
         itr_cell = ws.cell(excel_row, itr_col, itr_ref)
         note_cell = ws.cell(excel_row, review_col, visible_note)
+        note_cell.font = REVIEW_NOTE_FONT
 
         if itr_ref:
             itr_cell.font = RED_FONT
@@ -208,7 +302,7 @@ def _write_side_labels(
             itr_cell.fill = REVIEW_FILL
             note_cell.fill = REVIEW_FILL
 
-        note_cell.alignment = Alignment(wrap_text=True, vertical="top")
+        note_cell.alignment = Alignment(vertical="top", wrap_text=False)
 
 
 def _write_tax_reconciliation_table(
@@ -233,7 +327,7 @@ def _write_tax_reconciliation_table(
         cell = ws.cell(header_row, start_col + idx, col_name)
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", wrap_text=False)
 
     for r_idx, (_, row) in enumerate(df.iterrows(), start=header_row + 1):
         line_type = str(row.get("Line Type", "")).lower()
@@ -241,7 +335,7 @@ def _write_tax_reconciliation_table(
         for c_idx, col_name in enumerate(display_cols):
             value = _safe(row[col_name])
             cell = ws.cell(r_idx, start_col + c_idx, value)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.alignment = Alignment(vertical="top", wrap_text=False)
 
             if _is_number(value):
                 cell.number_format = '$#,##0.00;($#,##0.00);-'
@@ -315,13 +409,13 @@ def _write_simple_table(
         cell = ws.cell(header_row, start_col + idx, str(col_name))
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+        cell.alignment = Alignment(horizontal="center", wrap_text=False)
 
     for r_idx, (_, row) in enumerate(df.iterrows(), start=header_row + 1):
         for c_idx, col_name in enumerate(df.columns):
             value = _safe(row[col_name])
             cell = ws.cell(r_idx, start_col + c_idx, value)
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
+            cell.alignment = Alignment(vertical="top", wrap_text=False)
             cell.border = THIN_BORDER
 
             if input_table and value is None:
@@ -364,27 +458,44 @@ def _format_sheet(ws, raw_block_last_col: int) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = 22
 
 
-def write_workbook(raw_pl_df, raw_bs_df, workpaper) -> None:
+def write_workbook(reports, workpaper) -> None:
     logger.info("Writing workbook to %s", OUTPUT_PATH)
 
     wb = Workbook()
     wb.remove(wb.active)
 
-    _copy_sheet_to_workbook(PL_RAW_PATH, wb, SHEET_PL_RAW)
-    _copy_sheet_to_workbook(BS_RAW_PATH, wb, SHEET_BS_RAW)
+    # First two sheets: copy the selected original source sheets.
+    _copy_sheet_to_workbook(reports.pl_input, wb, SHEET_PL_RAW)
+    _copy_sheet_to_workbook(reports.bs_input, wb, SHEET_BS_RAW)
 
     ws = wb.create_sheet(SHEET_RECONCILIATION)
 
+    # Reconciliation sheet: copy original formatted P&L and BS blocks.
     pl_start_row = 1
-    pl_last_row, pl_last_col = _copy_report_area(PL_RAW_PATH, ws, pl_start_row, 1, copy_formulas=True)
+    pl_last_row, pl_last_col = _copy_report_area(
+        reports.pl_input,
+        ws,
+        pl_start_row,
+        1,
+        copy_formulas=True,
+    )
 
     bs_start_row = pl_last_row + 3
-    bs_last_row, bs_last_col = _copy_report_area(BS_RAW_PATH, ws, bs_start_row, 1, copy_formulas=True)
+    bs_last_row, bs_last_col = _copy_report_area(
+        reports.bs_input,
+        ws,
+        bs_start_row,
+        1,
+        copy_formulas=True,
+    )
 
     raw_last_col = max(pl_last_col, bs_last_col)
 
     itr_col = raw_last_col + 2
     review_col = raw_last_col + 3
+
+    ws.column_dimensions[get_column_letter(itr_col)].width = 16
+    ws.column_dimensions[get_column_letter(review_col)].width = 45
 
     _write_side_labels(ws, workpaper.labelled_pl, pl_start_row, itr_col, review_col)
     _write_side_labels(ws, workpaper.labelled_bs, bs_start_row, itr_col, review_col)
@@ -431,7 +542,6 @@ def write_workbook(raw_pl_df, raw_bs_df, workpaper) -> None:
         )
 
     _format_sheet(ws, raw_last_col)
-    _force_font_size_9(ws)
 
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True

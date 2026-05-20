@@ -10,19 +10,37 @@ from typing import Any
 
 import pandas as pd
 
-from cleaner import load_clean_reports, clean_amount
+from cleaner import CleanedReports, load_clean_report_bundle, clean_amount
 from config import (
-    TAX_RATE,
-    TAX_ADJUSTMENTS,
+    AUTO_POST_TAX_DEPRECIATION_TO_7F,
     CARRY_FORWARD_LOSSES_TEMPLATE,
     RD_BREAKDOWN_TEMPLATE,
     RD_OFFSET_AMOUNT,
+    TAX_ADJUSTMENTS,
+    TAX_RATE,
 )
 from itr_rules import WORKSHEET_2, validate_adjustment_label, get_item7_direction
 from labeller import label_report, extract_review_items
 
 logger = logging.getLogger(__name__)
 
+# make sure its build_workpaper() signature accepts reports
+def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
+    if reports is None:
+        reports = load_clean_report_bundle()
+
+    clean_pl_df = reports.clean_pl
+    clean_bs_df = reports.clean_bs
+
+    labelled_pl = label_report(clean_pl_df, "profit_and_loss")
+    labelled_bs = label_report(clean_bs_df, "balance_sheet")
+
+    tax_reconciliation = _build_tax_reconciliation(
+        clean_pl_df,
+        labelled_pl,
+        tax_depreciation_total=reports.tax_depreciation_total,
+        tax_depreciation_source=reports.tax_depreciation_source,
+    )
 
 @dataclass
 class Workpaper:
@@ -61,6 +79,9 @@ def _detect_amount_cols(df: pd.DataFrame) -> list[str]:
         "direction",
         "check",
         "explanation",
+        "source file",
+        "source sheet",
+        "detected report type",
     }
 
     amount_cols = []
@@ -259,13 +280,6 @@ def _auto_reconciliation_rows_from_labelled_pl(
     labelled_pl: pd.DataFrame,
     periods: list[str],
 ) -> tuple[list[dict], list[dict], dict[str, float], dict[str, float]]:
-    """
-    Convert labelled P&L account rows into tax reconciliation detail rows.
-
-    Only rows with Recon ITR Ref are posted.
-    Regular labels like 6C, 6A, 8R, BS do not affect taxable income.
-    Ambiguous review labels stay as review notes unless a rule explicitly sets Recon ITR Ref.
-    """
     add_rows: list[dict] = []
     subtract_rows: list[dict] = []
     total_add_backs = {period: 0.0 for period in periods}
@@ -332,7 +346,52 @@ def _auto_reconciliation_rows_from_labelled_pl(
     return add_rows, subtract_rows, total_add_backs, total_subtractions
 
 
-def _build_tax_reconciliation(clean_pl_df: pd.DataFrame, labelled_pl: pd.DataFrame) -> pd.DataFrame:
+def _tax_depreciation_reconciliation_rows(
+    periods: list[str],
+    tax_depreciation_total: float | None,
+    tax_depreciation_source: str | None,
+) -> tuple[list[dict], dict[str, float]]:
+    """Optionally post extracted tax depreciation to 7F.
+
+    Safe default is controlled by AUTO_POST_TAX_DEPRECIATION_TO_7F=False.
+    When enabled, this posts the amount to the first detected period.
+    """
+    rows: list[dict] = []
+    total_subtractions = {period: 0.0 for period in periods}
+
+    if not AUTO_POST_TAX_DEPRECIATION_TO_7F:
+        return rows, total_subtractions
+
+    if tax_depreciation_total is None or abs(tax_depreciation_total) < 0.005:
+        return rows, total_subtractions
+
+    if not periods:
+        return rows, total_subtractions
+
+    validate_adjustment_label("7F", "Tax depreciation / decline in value")
+
+    row = {
+        "Line Type": "detail",
+        "Description": "Tax depreciation / decline in value",
+        "ITR Ref": "7F",
+        "Review note": f"Auto-posted from tax depreciation support schedule: {tax_depreciation_source or 'source not recorded'}",
+    }
+
+    for idx, period in enumerate(periods):
+        amount = abs(tax_depreciation_total) if idx == 0 else 0.0
+        row[period] = amount
+        total_subtractions[period] += amount
+
+    rows.append(row)
+    return rows, total_subtractions
+
+
+def _build_tax_reconciliation(
+    clean_pl_df: pd.DataFrame,
+    labelled_pl: pd.DataFrame,
+    tax_depreciation_total: float | None = None,
+    tax_depreciation_source: str | None = None,
+) -> pd.DataFrame:
     net_profit_by_period, net_profit_methods = _extract_net_profit_by_period(clean_pl_df)
     periods = list(net_profit_by_period.keys())
 
@@ -357,8 +416,14 @@ def _build_tax_reconciliation(clean_pl_df: pd.DataFrame, labelled_pl: pd.DataFra
 
     manual_add_rows, manual_subtract_rows, manual_add_totals, manual_subtract_totals = _manual_adjustment_rows(periods)
 
+    tax_dep_rows, tax_dep_subtract_totals = _tax_depreciation_reconciliation_rows(
+        periods,
+        tax_depreciation_total,
+        tax_depreciation_source,
+    )
+
     add_rows = auto_add_rows + manual_add_rows
-    subtract_rows = auto_subtract_rows + manual_subtract_rows
+    subtract_rows = auto_subtract_rows + manual_subtract_rows + tax_dep_rows
 
     total_add_backs = {
         period: auto_add_totals[period] + manual_add_totals[period]
@@ -366,7 +431,11 @@ def _build_tax_reconciliation(clean_pl_df: pd.DataFrame, labelled_pl: pd.DataFra
     }
 
     total_subtractions = {
-        period: auto_subtract_totals[period] + manual_subtract_totals[period]
+        period: (
+            auto_subtract_totals[period]
+            + manual_subtract_totals[period]
+            + tax_dep_subtract_totals[period]
+        )
         for period in periods
     }
 
@@ -505,7 +574,11 @@ def _build_tax_reconciliation(clean_pl_df: pd.DataFrame, labelled_pl: pd.DataFra
     return pd.DataFrame(rows)[ordered_cols]
 
 
-def _extract_total_by_period(clean_df: pd.DataFrame, aliases: list[str], prefer_total: bool = True) -> dict[str, float]:
+def _extract_total_by_period(
+    clean_df: pd.DataFrame,
+    aliases: list[str],
+    prefer_total: bool = True,
+) -> dict[str, float]:
     account_col = _get_account_col(clean_df)
     amount_cols = _detect_amount_cols(clean_df)
 
@@ -578,13 +651,47 @@ def _build_bs_checks(clean_bs_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame([equity_variance, net_assets_variance])
 
 
-def build_workpaper() -> Workpaper:
-    clean_pl_df, clean_bs_df = load_clean_reports()
+def _build_tax_depreciation_review_item(reports: CleanedReports) -> pd.DataFrame:
+    if reports.tax_depreciation_total is None:
+        return pd.DataFrame()
+
+    if AUTO_POST_TAX_DEPRECIATION_TO_7F:
+        note = "Tax depreciation was auto-posted to 7F because AUTO_POST_TAX_DEPRECIATION_TO_7F=True."
+        recon_ref = "7F"
+    else:
+        note = "Tax depreciation schedule detected. Review whether this should be claimed at 7F."
+        recon_ref = ""
+
+    return pd.DataFrame([
+        {
+            "Source": "Tax Depreciation",
+            "Section": "Support schedule",
+            "Account": "Tax depreciation / decline in value",
+            "ITR Ref": "7F",
+            "Recon ITR Ref": recon_ref,
+            "Review Note": note,
+            "Reason": f"Extracted total {reports.tax_depreciation_total} from {reports.tax_depreciation_source}.",
+        }
+    ])
+
+
+def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
+    if reports is None:
+        reports = load_clean_report_bundle()
+
+    clean_pl_df = reports.clean_pl
+    clean_bs_df = reports.clean_bs
 
     labelled_pl = label_report(clean_pl_df, "profit_and_loss")
     labelled_bs = label_report(clean_bs_df, "balance_sheet")
 
-    tax_reconciliation = _build_tax_reconciliation(clean_pl_df, labelled_pl)
+    tax_reconciliation = _build_tax_reconciliation(
+        clean_pl_df,
+        labelled_pl,
+        tax_depreciation_total=reports.tax_depreciation_total,
+        tax_depreciation_source=reports.tax_depreciation_source,
+    )
+
     bs_checks = _build_bs_checks(clean_bs_df)
 
     carry_forward_losses = pd.DataFrame(CARRY_FORWARD_LOSSES_TEMPLATE)
@@ -594,6 +701,7 @@ def build_workpaper() -> Workpaper:
         [
             extract_review_items(labelled_pl, "P&L"),
             extract_review_items(labelled_bs, "BS"),
+            _build_tax_depreciation_review_item(reports),
         ],
         ignore_index=True,
     )
@@ -607,3 +715,4 @@ def build_workpaper() -> Workpaper:
         bs_checks=bs_checks,
         review_items=review_items,
     )
+

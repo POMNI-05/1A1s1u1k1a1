@@ -8,10 +8,17 @@ import pandas as pd
 from itr_rules import match_financial_label
 
 
+
 def get_account_col(df: pd.DataFrame) -> str:
+    # Prefer cleaner's internal visible label if available.
+    for col in df.columns:
+        if str(col).strip().lower() == "account label":
+            return col
+
     for col in df.columns:
         if str(col).strip().lower() in {"account", "description", "account name"}:
             return col
+
     return df.columns[0]
 
 
@@ -26,6 +33,35 @@ def _blank_label(treatment: str = "structure_or_check_only") -> dict:
         "Recon ITR Ref": "",
     }
 
+def _row_display_name(row: pd.Series, account_col: str) -> str:
+    primary = str(row.get(account_col, "") or "").strip()
+    if primary and primary.lower() not in {"nan", "none"}:
+        return primary
+
+    for value in row.tolist():
+        text = str(value or "").strip()
+        if not text or text.lower() in {"nan", "none"}:
+            continue
+
+        lower = text.lower()
+        if lower in {
+            "source row",
+            "row type",
+            "report section",
+            "itr ref",
+            "itr label",
+            "treatment",
+            "confidence",
+            "review note",
+            "label reason",
+            "recon itr ref",
+        }:
+            continue
+
+        if any(ch.isalpha() for ch in text):
+            return text
+
+    return primary
 
 def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
     out = df.copy()
@@ -37,10 +73,32 @@ def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
         account_name = row.get(account_col, "")
 
         if row_type == "account":
-            labels.append(match_financial_label(account_name, report_type, row.get("Report Section", "")))
+            labels.append(
+                match_financial_label(
+                    account_name,
+                    report_type,
+                    row.get("Report Section", ""),
+                )
+            )
             continue
 
-        if row_type == "total" and report_type == "profit_and_loss" and "net profit" in str(account_name).lower():
+        # Balance Sheet Item 8 labels are often on total rows.
+        if row_type == "total" and report_type == "balance_sheet":
+            labels.append(
+                match_financial_label(
+                    account_name,
+                    report_type,
+                    row.get("Report Section", ""),
+                )
+            )
+            continue
+
+        # P&L net profit total becomes Item 7T base.
+        if (
+            row_type == "total"
+            and report_type == "profit_and_loss"
+            and "net profit" in str(account_name).lower()
+        ):
             labels.append({
                 "ITR Ref": "7T",
                 "ITR Label": "Accounting profit/loss before tax",
@@ -58,7 +116,6 @@ def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
         [out.reset_index(drop=True), pd.DataFrame(labels).reset_index(drop=True)],
         axis=1,
     )
-
 
 def rows_requiring_highlight(labelled_df: pd.DataFrame) -> pd.DataFrame:
     if labelled_df is None or labelled_df.empty or "Confidence" not in labelled_df.columns:

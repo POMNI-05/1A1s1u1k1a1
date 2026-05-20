@@ -13,7 +13,7 @@ import os
 from itr_rules import TAX_RATES, RD_OFFSET_RATES, SMALL_BUSINESS_THRESHOLDS
 
 # ---------------------------------------------------------------------------
-# Paths
+# 1. Base settings and paths
 # ---------------------------------------------------------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
@@ -21,13 +21,57 @@ DOWNLOAD_DIR = DATA_DIR
 OUTPUT_DIR = os.path.join(BASE_DIR, "output")
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 
+# ---------------------------------------------------------------------------
+# 2. Input path
+# ---------------------------------------------------------------------------
+# 2. 0 Legacy / separate-file inputs. -> These keep the old pipeline working.
 PL_RAW_PATH = os.path.join(DATA_DIR, "profit_and_loss_raw.xlsx")
 BS_RAW_PATH = os.path.join(DATA_DIR, "balance_sheet_raw.xlsx")
-OUTPUT_PATH = os.path.join(OUTPUT_DIR, "xero_workpaper.xlsx")
 
-SHEET_PL_RAW = "Xero PL Raw"
-SHEET_BS_RAW = "Xero BS Raw"
+"""2. 1 Flexible / combined-workbook input."""
+
+# supports both separate-sheet and combined-workbook formats, controlled by ALLOW_COMBINED_WORKBOOK.
+INPUT_WORKBOOK_PATH = os.getenv(
+    "INPUT_WORKBOOK_PATH",
+    os.path.join(DATA_DIR, "xero_reports.xlsx"),
+)
+
+ALLOW_COMBINED_WORKBOOK = os.getenv(
+    "ALLOW_COMBINED_WORKBOOK",
+    "true",
+).lower() == "true"
+
+"""2. 2 Optional separate tax depreciation schedule."""
+TAX_DEPRECIATION_PATH = os.getenv(
+    "TAX_DEPRECIATION_PATH",
+    "",
+)
+
+"""2. 3 Force the sheet if auto-detection is wrong"""
+# Optional sheet-name overrides.
+# Leave blank to auto-detect.
+PL_SHEET_NAME = os.getenv("PL_SHEET_NAME", "")
+BS_SHEET_NAME = os.getenv("BS_SHEET_NAME", "")
+TAX_DEPRECIATION_SHEET_NAME = os.getenv("TAX_DEPRECIATION_SHEET_NAME", "")
+
+
+# ---------------------------------------------------------------------------
+# 3. Output path and output sheet names
+# ---------------------------------------------------------------------------
+OUTPUT_PATH = os.path.join(OUTPUT_DIR, "xero_workpaper2.xlsx")
+
+# tell write_workbook how to name output sheets
+SHEET_PL_RAW = "Profit and Loss"
+SHEET_BS_RAW = "Balance Sheet"
 SHEET_RECONCILIATION = "Tax Reconciliation"
+
+# ---------------------------------------------------------------------------
+# Report type constants
+# ---------------------------------------------------------------------------
+REPORT_TYPE_PL = "profit_and_loss"
+REPORT_TYPE_BS = "balance_sheet"
+REPORT_TYPE_TAX_DEPRECIATION = "tax_depreciation"
+REPORT_TYPE_UNKNOWN = "unknown"
 
 # ---------------------------------------------------------------------------
 # Selenium settings (if using Selenium for download)
@@ -103,6 +147,22 @@ CARRY_FORWARD_LOSSES_TEMPLATE = [
     {"Description": "Total Losses", "Amount": None},
 ]
 
+# ---------------------------------------------------------------------------
+# Tax depreciation support handling
+# ---------------------------------------------------------------------------
+# Safer default:
+# - extract tax depreciation total as support;
+# - do not automatically post it into taxable income unless reviewed.
+AUTO_POST_TAX_DEPRECIATION_TO_7F = os.getenv(
+    "AUTO_POST_TAX_DEPRECIATION_TO_7F",
+    "false",
+).lower() == "true"
+
+
+
+# ---------------------------------------------------------------------------
+#  support templates
+# ---------------------------------------------------------------------------
 # RD_BREAKDOWN = {
 #     "eligible_spend": 0.0,
 #     "expensed": 0.0,

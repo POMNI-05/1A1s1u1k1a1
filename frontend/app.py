@@ -193,6 +193,7 @@ with left:
             T.UPLOAD_COMBINED_LABEL,
             type=T.UPLOAD_FILE_TYPES,
             help=T.UPLOAD_COMBINED_HELP,
+            accept_multiple_files=True,
         )
     else:
         col_pl, col_bs = st.columns(2)
@@ -201,12 +202,14 @@ with left:
                 T.UPLOAD_PL_LABEL,
                 type=T.UPLOAD_FILE_TYPES,
                 help=T.UPLOAD_PL_HELP,
+                accept_multiple_files=True,
             )
         with col_bs:
             bs_file = st.file_uploader(
                 T.UPLOAD_BS_LABEL,
                 type=T.UPLOAD_FILE_TYPES,
                 help=T.UPLOAD_BS_HELP,
+                accept_multiple_files=True,
             )
 
     # ── Section 2: Client profile ─────────────────────────────────────────────
@@ -249,10 +252,10 @@ with left:
     if generate_clicked:
         # Validate inputs
         valid = True
-        if upload_mode == T.UPLOAD_MODE_COMBINED and combined_file is None:
+        if upload_mode == T.UPLOAD_MODE_COMBINED and combined_file:
             st.error(T.ERROR_COMBINED_MISSING)
             valid = False
-        elif upload_mode == T.UPLOAD_MODE_SEPARATE and (pl_file is None or bs_file is None):
+        elif upload_mode == T.UPLOAD_MODE_SEPARATE and (pl_file is None or bs_file):
             st.error(T.ERROR_SEPARATE_MISSING)
             valid = False
 

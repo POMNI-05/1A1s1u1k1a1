@@ -34,3 +34,12 @@ logs/
 __pycache__/
 *.pyc
 LICENSE
+
+
+# Ignore generated frontend files
+frontend/uploads/*
+frontend/downloads/*
+
+# But keep the folder placeholders
+!frontend/uploads/.gitkeep
+!frontend/downloads/.gitkeep

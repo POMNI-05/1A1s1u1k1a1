@@ -1,4 +1,23 @@
-**Xero-automation project introduction**:
+# Tax Workpaper Generator
+
+## First-time setup
+
+1. Install Python 3.11 or 3.12.
+2. Unzip this folder.
+3. Double-click `run_app.bat`.
+4. Wait for the browser app to open.
+5. Upload the Xero Excel workbook(s).
+6. Click Generate workpaper.
+7. Download the generated Excel file.
+
+## Notes
+
+- VS Code is not required.
+- Do not close the command window while using the app.
+- If the app does not open automatically, copy the local URL shown in the command window into Chrome.
+- Xero automatic download is not required for normal use. Upload exported Excel reports manually.
+
+**PL / BS -> Tax return - automation project introduction**:
 Automated tax workpaper pipeline for Australian accounting practices
 
 

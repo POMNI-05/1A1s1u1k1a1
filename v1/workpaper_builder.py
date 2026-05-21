@@ -19,7 +19,7 @@ from config import (
     TAX_ADJUSTMENTS,
     TAX_RATE,
 )
-from itr_rules import WORKSHEET_2, validate_adjustment_label, get_item7_direction
+from itr_metadata import WORKSHEET_2, validate_adjustment_label, get_item7_direction
 from labeller import label_report, extract_review_items
 
 logger = logging.getLogger(__name__)

@@ -5,12 +5,13 @@ Central configuration for the Xero workpaper pipeline.
 Design rule:
 - Raw Xero P&L and BS are source documents and are not recalculated or overwritten.
 - cleaner.py only parses/chunks those reports into structured rows.
-- itr_rules.py contains labelling and tax-reconciliation rule metadata.
+- itr_metadata.py contains static ATO/ITR metadata.
+- itr_rules.py contains account matching and labelling logic.
 - TAX_ADJUSTMENTS contains actual tax reconciliation amounts after review.
 """
 from __future__ import annotations
 import os
-from itr_rules import TAX_RATES, RD_OFFSET_RATES, SMALL_BUSINESS_THRESHOLDS
+from itr_metadata import TAX_RATES, RD_OFFSET_RATES, SMALL_BUSINESS_THRESHOLDS
 
 # ---------------------------------------------------------------------------
 # 1. Base settings and paths
@@ -58,7 +59,7 @@ TAX_DEPRECIATION_SHEET_NAME = os.getenv("TAX_DEPRECIATION_SHEET_NAME", "")
 # ---------------------------------------------------------------------------
 # 3. Output path and output sheet names
 # ---------------------------------------------------------------------------
-OUTPUT_PATH = os.path.join(OUTPUT_DIR, "xero_workpaper2.xlsx")
+OUTPUT_PATH = os.path.join(OUTPUT_DIR, "5_ZHI_output.xlsx")
 
 # tell write_workbook how to name output sheets
 SHEET_PL_RAW = "Profit and Loss"
@@ -122,12 +123,12 @@ TAX_ADJUSTMENTS = {
     "add_back_7B": [],
     "add_back_7W": [],
     "add_back_7D": [],
+    "add_back_7Y": [],
     "subtract_7Q": [],
     "subtract_7X": [],
     "subtract_7F": [],
     "subtract_7I": [],
     "subtract_7Z": [],
-    "subtract_7Y": [],
     "subtract_7R": [],
 }
 

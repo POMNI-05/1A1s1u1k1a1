@@ -1,5 +1,20 @@
 # v1/itr_rules.py
-"""Account labelling and Item 7 tax-workpaper rule metadata."""
+"""Account-name matching and ITR labelling logic.
+
+Static ATO / ITR metadata lives in itr_metadata.py.
+
+This file should answer:
+- Given a Xero/accounting row name, what ITR label is the best match?
+- Is that match high/medium/low confidence?
+- Is it label-only, review-only, support-only, or tax-reconciliation relevant?
+
+This file should NOT contain:
+- tax rates
+- ATO thresholds
+- Item 7 master metadata
+- Items 8-25 return templates
+- worksheet layout metadata
+"""
 
 from __future__ import annotations
 
@@ -7,55 +22,31 @@ import re
 from typing import Iterable
 
 
-TAX_RATES = {"base_rate_entity": 0.25, "general": 0.30}
-
-RD_OFFSET_RATES = {"refundable": 0.435, "non_refundable": 0.385}
-
-SMALL_BUSINESS_THRESHOLDS = {
-    "aggregated_turnover": 10_000_000,
-    "base_rate_entity_turnover": 50_000_000,
-    "rd_refundable_turnover": 20_000_000,
-    "instant_asset_writeoff": 20_000,
-}
-
-
-ITEM_7_LABELS = {
-    "7T": {"name": "Total profit or loss", "direction": "base", "active": True},
-    "7A": {"name": "Net capital gain", "direction": "add", "active": True},
-    "7B": {"name": "Other assessable income", "direction": "add", "active": True},
-    "7D": {"name": "R&D expenditure in accounts", "direction": "add", "active": True},
-    "7W": {"name": "Non-deductible expenses", "direction": "add", "active": True},
-    "7F": {"name": "Decline in value", "direction": "subtract", "active": True},
-    "7I": {"name": "Capital works", "direction": "subtract", "active": True},
-    "7Q": {"name": "Non-assessable income", "direction": "subtract", "active": True},
-    "7R": {"name": "Tax losses deducted", "direction": "subtract", "active": True},
-    "7X": {"name": "Other deductible expenses", "direction": "subtract", "active": True},
-    "7Y": {"name": "Build-to-rent 4% capital works", "direction": "subtract", "active": True},
-    "7Z": {"name": "Section 40-880 deduction", "direction": "subtract", "active": True},
-    "7J": {"name": "Small business skills/training boost", "active": False, "removed_in": "2025"},
-    "7K": {"name": "Small business energy incentive", "active": False, "removed_in": "2025"},
-}
-
-
-WORKSHEET_2 = {
-    "add_back_7B": {"label": "7B", "direction": "add", "heading": "Other assessable income"},
-    "add_back_7D": {"label": "7D", "direction": "add", "heading": "R&D expenditure in accounts"},
-    "add_back_7W": {"label": "7W", "direction": "add", "heading": "Non-deductible expenses"},
-    "subtract_7F": {"label": "7F", "direction": "subtract", "heading": "Decline in value"},
-    "subtract_7I": {"label": "7I", "direction": "subtract", "heading": "Capital works"},
-    "subtract_7Q": {"label": "7Q", "direction": "subtract", "heading": "Non-assessable income"},
-    "subtract_7R": {"label": "7R", "direction": "subtract", "heading": "Tax losses deducted"},
-    "subtract_7X": {"label": "7X", "direction": "subtract", "heading": "Other deductible expenses"},
-    "subtract_7Y": {"label": "7Y", "direction": "subtract", "heading": "Build-to-rent capital works"},
-    "subtract_7Z": {"label": "7Z", "direction": "subtract", "heading": "Section 40-880 deduction"},
-}
-
-
+# ---------------------------------------------------------------------------
+# A. Financial label rules
+# ---------------------------------------------------------------------------
 # Tuple format:
-# patterns, itr_ref, itr_label, treatment, confidence, review_note, reason, recon_itr_ref
+# (
+#     patterns,
+#     itr_ref,
+#     itr_label,
+#     treatment,
+#     confidence,
+#     review_note,
+#     reason,
+#     recon_itr_ref,
+# )
 #
-# recon_itr_ref controls whether the P&L account auto-appears in the tax reconciliation table.
-# Blank recon_itr_ref means: label it only; do not calculate tax adjustment from it.
+# treatment:
+# - financial_label_only = useful return label, but does not change taxable income
+# - review_only          = accountant should review before using
+# - support_only         = support/check row only, not a return label
+#
+# recon_itr_ref:
+# - blank means do not include in tax reconciliation
+# - non-blank means this P&L account may feed the tax reconciliation
+# - only use non-blank where the rule is conservative enough for review workflow
+
 FINANCIAL_LABEL_RULES = {
     "profit_and_loss": [
         # ------------------------------------------------------------------
@@ -111,7 +102,7 @@ FINANCIAL_LABEL_RULES = {
                 r"cost of sales",
                 r"cost of goods sold",
                 r"purchases",
-                r"freight in",
+                r"freight in", # a what ?? 
                 r"freight out",
                 r"packaging",
                 r"stamp duty on acquisition",
@@ -126,12 +117,12 @@ FINANCIAL_LABEL_RULES = {
         ),
 
         # ------------------------------------------------------------------
-        # Specific expenses
+        # Payroll / employee costs
         # ------------------------------------------------------------------
         (
             [r"wages", r"salaries", r"payroll", r"staff salaries"],
-            "8D",
-            "Wages",
+            "8D-sw",
+            "Total salary and wage expenses",
             "financial_label_only",
             "high",
             "PAYG/super ok?",
@@ -150,7 +141,7 @@ FINANCIAL_LABEL_RULES = {
         ),
         (
             [r"annual leave", r"long service leave", r"provision"],
-            "6S / 8D",
+            "6S / 7W / 7X",
             "Leave/provision",
             "review_only",
             "medium",
@@ -158,6 +149,10 @@ FINANCIAL_LABEL_RULES = {
             "Provision timing may need add-back or deduction.",
             "",
         ),
+
+        # ------------------------------------------------------------------
+        # Specific expenses
+        # ------------------------------------------------------------------
         (
             [r"rent", r"lease"],
             "6H",
@@ -279,7 +274,7 @@ FINANCIAL_LABEL_RULES = {
             "",
         ),
         (
-            [r"forex", r"foreign exchange", r"fx"],
+            [r"forex", r"foreign exchange", r"\bfx\b"],
             "7B / 7Q / 7X",
             "Forex",
             "review_only",
@@ -418,24 +413,527 @@ FINANCIAL_LABEL_RULES = {
             "Equity account supports BS checks; no direct Item 8 label assigned unless using a total equity check internally.",
             "",
         ),
+
+        # common tax recinciliation relevant labels - these may be review-only but should be included in reconciliation if matched
+                (
+            [r"income tax expense", r"company tax", r"tax expense", r"tax provision"],
+            "7W",
+            "Income tax expense",
+            "review_only",
+            "medium",
+            "Add back income tax expense; confirm this is company income tax and not payroll/GST.",
+            "Income tax expense is generally non-deductible and usually added back.",
+            "7W",
+        ),
+        (
+            [r"deferred tax", r"deferred income tax", r"deferred tax expense", r"deferred tax benefit"],
+            "7W / 7X",
+            "Deferred tax",
+            "review_only",
+            "medium",
+            "Remove accounting deferred tax effect from taxable income calculation.",
+            "Deferred tax is an accounting entry and does not directly determine taxable income.",
+            "",
+        ),
+        (
+            [r"fine", r"penalty", r"speeding", r"traffic infringement", r"parking fine"],
+            "7W",
+            "Fines and penalties",
+            "review_only",
+            "medium",
+            "Add back non-deductible fines and penalties.",
+            "Fines and penalties are commonly non-deductible.",
+            "7W",
+        ),
+        (
+            [r"doubtful debt", r"bad debt provision", r"provision for doubtful debts", r"impairment.*receivable"],
+            "7W / 7X",
+            "Bad debts / doubtful debts",
+            "review_only",
+            "medium",
+            "Add back general provisions; deduct only specific bad debts written off if tax requirements are met.",
+            "Accounting doubtful debt provisions often differ from tax bad debt deductions.",
+            "",
+        ),
+        (
+            [r"prepaid", r"prepayment"],
+            "7W / 7X",
+            "Prepaid expenses",
+            "review_only",
+            "medium",
+            "Check whether tax spreading/prepayment rules apply.",
+            "Prepaid expenses may be deductible over a different period for tax.",
+            "",
+        ),
+        (
+            [r"capital expense", r"capitalised", r"capitalized", r"establishment cost", r"acquisition cost"],
+            "7W / 7Z",
+            "Capital expenses expensed",
+            "review_only",
+            "medium",
+            "Review whether accounting expense is capital and should be added back or deducted over time.",
+            "Capital expenses expensed in accounts may not be immediately deductible.",
+            "",
+        ),
+        (
+            [r"project pool", r"blackhole", r"black hole", r"section 40 880", r"s40 880"],
+            "7Z",
+            "Section 40-880 / project expenditure",
+            "review_only",
+            "medium",
+            "Confirm eligibility and deduction period.",
+            "Business capital expenditure may be deductible over time under specific provisions.",
+            "7Z",
+        ),
+        (
+            [r"repair", r"repairs", r"maintenance", r"improvement", r"fitout", r"fit out"],
+            "6S / 7W / 7X",
+            "Repairs and improvements",
+            "review_only",
+            "medium",
+            "Confirm repair versus capital improvement treatment.",
+            "Repairs may be deductible, while capital improvements may need add-back/capital allowance treatment.",
+            "",
+        ),
+        (
+            [r"make good", r"make-good", r"lease incentive", r"right of use", r"rou asset", r"aasb 16"],
+            "7W / 7X",
+            "Lease accounting differences",
+            "review_only",
+            "medium",
+            "Review tax timing versus accounting lease treatment.",
+            "Lease accounting entries may not match tax deductions.",
+            "",
+        ),
+        (
+            [r"non assessable", r"non-assessable", r"exempt income", r"nane"],
+            "7Q",
+            "Non-assessable income",
+            "review_only",
+            "medium",
+            "Confirm whether income is exempt or non-assessable non-exempt.",
+            "Accounting income that is not assessable may need subtraction at Item 7.",
+            "7Q",
+        ),
+        (
+            [r"franked dividend", r"dividend income", r"franking credit", r"imputation credit"],
+            "7B / 7Q",
+            "Dividends and franking credits",
+            "review_only",
+            "medium",
+            "Review dividend assessability, gross-up and franking credit treatment.",
+            "Accounting treatment of dividends/franking credits may not match tax return treatment.",
+            "",
+        ),
+        (
+            [r"loss.*disposal", r"loss.*sale.*asset", r"asset disposal loss"],
+            "7W / 7X",
+            "Loss on disposal of assets",
+            "review_only",
+            "medium",
+            "Remove accounting loss and substitute tax/CGT treatment if required.",
+            "Accounting disposal losses may differ from tax capital/revenue treatment.",
+            "",
+        ),
+        (
+            [r"trading stock", r"inventory", r"stock adjustment", r"obsolete stock", r"stock write down"],
+            "8N / 8B / 7W / 7X",
+            "Trading stock / inventory",
+            "review_only",
+            "medium",
+            "Check opening stock, closing stock, obsolete stock and tax valuation.",
+            "Trading stock tax treatment may differ from accounting treatment.",
+            "",
+        ),
+        (
+            [r"tax loss", r"prior year loss", r"carry forward loss", r"carried forward loss"],
+            "7R",
+            "Prior year tax losses",
+            "review_only",
+            "medium",
+            "Do not auto-deduct. Confirm loss availability and recoupment tests.",
+            "Prior year tax losses require manual review before deduction.",
+            "",
+        ),
     ],
 }
 
+BS_DIRECT_TOTAL_RULES = [
+    (
+        [r"^total current assets$", r"^current assets$"],
+        "8D",
+        "All current assets",
+        "financial_label_only",
+        "high",
+        "",
+        "Matched Balance Sheet total current assets to Item 8D.",
+        "",
+    ),
+    (
+        [r"^total assets$", r"^assets$"],
+        "8E",
+        "Total assets",
+        "financial_label_only",
+        "high",
+        "",
+        "Matched Balance Sheet total assets to Item 8E.",
+        "",
+    ),
+    (
+        [r"^total current liabilities$", r"^current liabilities$"],
+        "8G",
+        "All current liabilities",
+        "financial_label_only",
+        "high",
+        "",
+        "Matched Balance Sheet total current liabilities to Item 8G.",
+        "",
+    ),
+    (
+        [r"^total liabilities$", r"^liabilities$"],
+        "8H",
+        "Total liabilities",
+        "financial_label_only",
+        "high",
+        "",
+        "Matched Balance Sheet total liabilities to Item 8H.",
+        "",
+    ),
+]
 
-def validate_adjustment_label(label: str, description: str = "") -> None:
-    info = ITEM_7_LABELS.get(label)
+BS_SUPPORT_RULES = [
+    # Cash / bank / current asset support
+    (
+        [
+            r"\bbank\b",
+            r"\bcash\b",
+            r"cheque account",
+            r"business saver",
+            r"investment account",
+            r"paypal",
+            r"airwallex",
+            r"stripe",
+            r"undeposited funds",
+            r"unreconciled deposits",
+            r"amazon deposits",
+            r"float exchange",
+            r"petty cash",
+            r"amex account",
+        ],
+        "8D-support",
+        "Cash/bank support for current assets",
+        "support_only",
+        "high",
+        "",
+        "Cash/bank account supports Item 8D but should not replace Total Current Assets.",
+        "",
+    ),
 
-    if info is None:
-        raise ValueError(f"Unknown ITR label {label!r} in adjustment {description!r}.")
+    # Trade debtors
+    (
+        [
+            r"accounts? receivable",
+            r"account receivable",
+            r"trade receivable",
+            r"\bdebtors?\b",
+            r"unbilled ar",
+            r"receivable fx",
+            r"receivable reconciliation",
+        ],
+        "8C",
+        "Trade debtors",
+        "financial_label_only",
+        "high",
+        "Confirm debtor balance at year end if unusual.",
+        "Matched receivable/debtor account to Item 8C.",
+        "",
+    ),
 
-    if not info.get("active", False):
-        raise ValueError(f"ITR label {label!r} was removed in {info.get('removed_in', 'unknown year')}.")
+    # Tax refund is current asset support, not trade debtor
+    (
+        [r"tax refund due", r"income tax refund", r"ato receivable"],
+        "8D-support",
+        "Tax receivable support for current assets",
+        "support_only",
+        "medium",
+        "Check tax refund receivable balance.",
+        "Tax receivable supports Item 8D current assets, not trade debtors.",
+        "",
+    ),
 
+    # Inventory / stock
+    (
+        [
+            r"\bstock\b",
+            r"\binventory\b",
+            r"stock on hand",
+            r"trading stock",
+            r"inventory in transit",
+            r"consignment inventory",
+            r"in-transit",
+        ],
+        "8B",
+        "Closing stock",
+        "review_only",
+        "medium",
+        "Check closing stock valuation, obsolete stock and tax treatment.",
+        "Matched stock/inventory account to Item 8B review.",
+        "",
+    ),
 
-def get_item7_direction(label: str) -> str:
-    validate_adjustment_label(label)
-    return ITEM_7_LABELS[label].get("direction", "")
+    # Prepayments / deposits
+    (
+        [
+            r"prepayment",
+            r"prepaid",
+            r"supplier prepayments",
+            r"\bdeposit\b",
+            r"deposits paid",
+            r"bond",
+            r"bank g'?tee",
+            r"guarantee",
+        ],
+        "8D-support",
+        "Prepayment/deposit support for current assets",
+        "review_only",
+        "medium",
+        "Check whether tax spreading/prepayment adjustment is required.",
+        "Matched prepayment/deposit account. Supports 8D but may require tax timing review.",
+        "",
+    ),
 
+    # Capitalised inventory/freight/duty/materials
+    (
+        [
+            r"freight to be capitalised",
+            r"duty to be capitalised",
+            r"materials? to be capitalised",
+            r"capitalised",
+            r"capitalized",
+        ],
+        "8D-support",
+        "Capitalised cost support for current assets",
+        "review_only",
+        "medium",
+        "Review whether capitalised cost affects stock/current assets and tax timing.",
+        "Matched capitalised cost account.",
+        "",
+    ),
+
+    # Fixed assets / non-current assets
+    (
+        [
+            r"property, plant",
+            r"\bppe\b",
+            r"plant",
+            r"equipment",
+            r"computer",
+            r"it equipment",
+            r"vehicle",
+            r"motor vehicle",
+            r"furniture",
+            r"fittings",
+            r"leasehold improvement",
+            r"right of use asset",
+        ],
+        "8E-support",
+        "Fixed asset support for total assets",
+        "support_only",
+        "medium",
+        "",
+        "Fixed asset account supports Item 8E total assets.",
+        "",
+    ),
+
+    # Intangibles
+    (
+        [
+            r"patent",
+            r"trademark",
+            r"trade mark",
+            r"goodwill",
+            r"intangible",
+            r"web dev",
+            r"systems",
+            r"certificates",
+        ],
+        "8E-support",
+        "Intangible asset support for total assets",
+        "support_only",
+        "medium",
+        "",
+        "Intangible asset account supports Item 8E total assets.",
+        "",
+    ),
+
+    # Accumulated depreciation / amortisation
+    (
+        [
+            r"accum dep",
+            r"acc dep",
+            r"accumulated depreciation",
+            r"depn",
+            r"amortize",
+            r"amortisation",
+            r"amortization",
+        ],
+        "8E-support",
+        "Accumulated depreciation/amortisation support",
+        "support_only",
+        "medium",
+        "",
+        "Contra asset account supports net total assets but is not a separate Item 8 label.",
+        "",
+    ),
+
+    # Trade creditors
+    (
+        [
+            r"accounts? payable",
+            r"account payable",
+            r"trade payable",
+            r"\bcreditors?\b",
+            r"payable fx",
+        ],
+        "8F",
+        "Trade creditors",
+        "financial_label_only",
+        "high",
+        "Confirm creditor balance at year end if unusual.",
+        "Matched payable/creditor account to Item 8F.",
+        "",
+    ),
+
+    # Credit cards and payables support
+    (
+        [
+            r"credit card",
+            r"amex",
+            r"qantas business card",
+            r"altitude",
+        ],
+        "8G-support",
+        "Current liability support",
+        "support_only",
+        "medium",
+        "Confirm current liability classification.",
+        "Credit card/payable account supports Item 8G.",
+        "",
+    ),
+
+    # GST/BAS/PAYG/tax liabilities
+    (
+        [
+            r"\bgst\b",
+            r"\bbas\b",
+            r"payg",
+            r"withholding",
+            r"ato payable",
+            r"tax payable",
+            r"input tax",
+            r"output tax",
+            r"vat",
+            r"sales tax",
+        ],
+        "8G-support",
+        "Tax payable support for current liabilities",
+        "support_only",
+        "medium",
+        "Agree BAS/GST/PAYG balance to lodgements where relevant.",
+        "Tax payable account supports Item 8G current liabilities.",
+        "",
+    ),
+
+    # Payroll liabilities
+    (
+        [
+            r"superannuation payable",
+            r"super payable",
+            r"workers compensation payable",
+            r"payroll clearing",
+            r"payroll payable",
+            r"wages payable",
+            r"provision for holiday leave",
+            r"provision for ls leave",
+        ],
+        "8G-support",
+        "Payroll liability support for current liabilities",
+        "review_only",
+        "medium",
+        "Check paid date and timing treatment where relevant.",
+        "Payroll liability account supports Item 8G and may require timing review.",
+        "",
+    ),
+
+    # Provisions / accruals
+    (
+        [
+            r"provision",
+            r"accrual",
+            r"accrued",
+            r"audit fee accrual",
+            r"general accruals",
+        ],
+        "8G-support",
+        "Provision/accrual support for current liabilities",
+        "review_only",
+        "medium",
+        "Check deductibility and timing treatment.",
+        "Provision/accrual supports Item 8G and may require tax timing review.",
+        "",
+    ),
+
+    # Debt / finance
+    (
+        [
+            r"\bloan\b",
+            r"borrowings?",
+            r"finance",
+            r"trade finance",
+            r"export finance",
+            r"working capital",
+            r"wayflyer",
+            r"hire purchase",
+            r"chattel mortgage",
+            r"lease liability",
+            r"lease liabilities",
+            r"intercompany",
+            r"owed to",
+            r"accumulated interest",
+        ],
+        "8J",
+        "Total debt",
+        "review_only",
+        "medium",
+        "Confirm whether this should be included in Item 8J Total debt.",
+        "Matched debt/finance account to Item 8J review.",
+        "",
+    ),
+
+    # Equity
+    (
+        [
+            r"retained earnings",
+            r"current year earnings",
+            r"ytd net income",
+            r"share capital",
+            r"owner.*equity",
+            r"shareholder",
+            r"drawings",
+            r"reserves",
+        ],
+        "",
+        "Equity support",
+        "support_only",
+        "medium",
+        "",
+        "Equity account is not an Item 8 financial label.",
+        "",
+    ),
+]
+# ---------------------------------------------------------------------------
+# B. Rule helpers
+# ---------------------------------------------------------------------------
 
 def _normalise_rule_text(value: str) -> str:
     text = str(value or "").strip().lower()
@@ -471,6 +969,10 @@ def _match_rules(text: str, rules: Iterable[tuple]) -> dict | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# C. Public matching function
+# ---------------------------------------------------------------------------
+
 def match_financial_label(
     account_name: str,
     report_type: str,
@@ -480,6 +982,7 @@ def match_financial_label(
     section = _normalise_rule_text(report_section)
 
     matched = _match_rules(text, FINANCIAL_LABEL_RULES.get(report_type, []))
+
     if matched:
         return matched
 
@@ -536,83 +1039,135 @@ def match_financial_label(
             }
 
     if report_type == "balance_sheet":
-        if text in {"current assets", "total current assets"}:
+        # 1. Direct total rows first.
+        direct_total_match = _match_rules(text, BS_DIRECT_TOTAL_RULES)
+        if direct_total_match:
+            return direct_total_match
+
+        # 2. Specific BS account rules.
+        bs_support_match = _match_rules(text, BS_SUPPORT_RULES)
+        if bs_support_match:
+            return bs_support_match
+
+        # 3. Section fallback.
+        # This prevents obvious Balance Sheet rows from becoming useless Review rows.
+
+        if "cash" in section or "bank" in section:
             return {
-                "ITR Ref": "8D",
-                "ITR Label": "All current assets",
-                "Treatment": "financial_label_only",
+                "ITR Ref": "8D-support",
+                "ITR Label": "Cash/bank support for current assets",
+                "Treatment": "support_only",
                 "Confidence": "high",
                 "Review Note": "",
-                "Label Reason": "Mapped from BS row name to Company tax return Item 8D.",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8D support.",
                 "Recon ITR Ref": "",
             }
 
-        if text in {"assets", "total assets"}:
+        if "receivable" in section or "debtor" in section:
             return {
-                "ITR Ref": "8E",
-                "ITR Label": "Total assets",
+                "ITR Ref": "8C",
+                "ITR Label": "Trade debtors",
                 "Treatment": "financial_label_only",
                 "Confidence": "high",
-                "Review Note": "",
-                "Label Reason": "Mapped from BS row name to Company tax return Item 8E.",
+                "Review Note": "Confirm debtor balance at year end if unusual.",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8C.",
                 "Recon ITR Ref": "",
             }
 
-        if text in {"current liabilities", "total current liabilities"}:
+        if "inventory" in section or "stock" in section:
             return {
-                "ITR Ref": "8G",
-                "ITR Label": "All current liabilities",
-                "Treatment": "financial_label_only",
-                "Confidence": "high",
-                "Review Note": "",
-                "Label Reason": "Mapped from BS row name to Company tax return Item 8G.",
+                "ITR Ref": "8B",
+                "ITR Label": "Closing stock",
+                "Treatment": "review_only",
+                "Confidence": "medium",
+                "Review Note": "Check closing stock valuation, obsolete stock and tax treatment.",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8B review.",
                 "Recon ITR Ref": "",
             }
 
-        if text in {"liabilities", "total liabilities"}:
+        if "current asset" in section or "other current asset" in section:
             return {
-                "ITR Ref": "8H",
-                "ITR Label": "Total liabilities",
-                "Treatment": "financial_label_only",
-                "Confidence": "high",
-                "Review Note": "",
-                "Label Reason": "Mapped from BS row name to Company tax return Item 8H.",
-                "Recon ITR Ref": "",
-            }
-
-        if "asset" in section:
-            return {
-                "ITR Ref": "",
-                "ITR Label": "BS asset support",
+                "ITR Ref": "8D-support",
+                "ITR Label": "Current asset support",
                 "Treatment": "support_only",
                 "Confidence": "medium",
-                "Review Note": "Supports Item 8 asset labels; use totals for return labels.",
-                "Label Reason": "Mapped from BS asset section as support only.",
+                "Review Note": "",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8D support.",
                 "Recon ITR Ref": "",
             }
 
-        if "liabilit" in section:
+        if (
+            "fixed asset" in section
+            or "non-current asset" in section
+            or "non current asset" in section
+            or "intangible" in section
+            or "patent" in section
+            or "trademark" in section
+        ):
             return {
-                "ITR Ref": "",
-                "ITR Label": "BS liability support",
+                "ITR Ref": "8E-support",
+                "ITR Label": "Asset support for total assets",
                 "Treatment": "support_only",
                 "Confidence": "medium",
-                "Review Note": "Supports Item 8 liability labels; use totals for return labels.",
-                "Label Reason": "Mapped from BS liability section as support only.",
+                "Review Note": "",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8E support.",
                 "Recon ITR Ref": "",
             }
 
-        if section == "equity":
+        if "payable" in section or "creditor" in section:
+            return {
+                "ITR Ref": "8F",
+                "ITR Label": "Trade creditors",
+                "Treatment": "financial_label_only",
+                "Confidence": "high",
+                "Review Note": "Confirm creditor balance at year end if unusual.",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8F.",
+                "Recon ITR Ref": "",
+            }
+
+        if "payroll liabilit" in section or "tax liabilit" in section:
+            return {
+                "ITR Ref": "8G-support",
+                "ITR Label": "Current liability support",
+                "Treatment": "support_only",
+                "Confidence": "medium",
+                "Review Note": "Check paid date, BAS/PAYG/GST reconciliation or timing treatment where relevant.",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8G support.",
+                "Recon ITR Ref": "",
+            }
+
+        if "current liabilit" in section or "provision" in section:
+            return {
+                "ITR Ref": "8G-support",
+                "ITR Label": "Current liability support",
+                "Treatment": "support_only",
+                "Confidence": "medium",
+                "Review Note": "",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8G support.",
+                "Recon ITR Ref": "",
+            }
+
+        if "non-current liabilit" in section or "non current liabilit" in section:
+            return {
+                "ITR Ref": "8H-support",
+                "ITR Label": "Non-current liability support",
+                "Treatment": "support_only",
+                "Confidence": "medium",
+                "Review Note": "",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as Item 8H support.",
+                "Recon ITR Ref": "",
+            }
+
+        if "equity" in section:
             return {
                 "ITR Ref": "",
                 "ITR Label": "Equity support",
                 "Treatment": "support_only",
                 "Confidence": "medium",
                 "Review Note": "",
-                "Label Reason": "Mapped from equity section as support only.",
+                "Label Reason": f"Mapped from Balance Sheet section {report_section!r} as support only.",
                 "Recon ITR Ref": "",
             }
-
     return {
         "ITR Ref": "Review",
         "ITR Label": "Unmapped",
@@ -625,6 +1180,8 @@ def match_financial_label(
 
 
 def match_account_to_itr(account_name: str, report_type: str) -> dict:
+    """Backward-compatible wrapper for older scripts."""
+
     result = match_financial_label(account_name, report_type)
 
     return {

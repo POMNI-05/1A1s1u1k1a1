@@ -245,12 +245,32 @@ def _copy_report_area(
 
     return start_row + src_ws.max_row - 1, start_col + src_ws.max_column - 1
 
+def should_highlight_mapping(mapping: dict, report_type: str = "") -> bool:
+    itr_ref = str(mapping.get("ITR Ref", "") or "").strip()
+    treatment = str(mapping.get("Treatment", "") or "").lower().strip()
+    confidence = str(mapping.get("Confidence", "") or "").lower().strip()
+
+    if itr_ref == "Review":
+        return True
+
+    if confidence == "low":
+        return True
+
+    if report_type == "balance_sheet" and treatment == "support_only":
+        return False
+
+    if treatment == "review_only":
+        return True
+
+    return False
+
 def _write_side_labels(
     ws,
     labelled_df: pd.DataFrame,
     source_start_row: int,
     itr_col: int,
     review_col: int,
+    report_type: str = "",
 ) -> None:
     ws.cell(source_start_row, itr_col, "ITR Ref")
     ws.cell(source_start_row, review_col, "Review note")
@@ -298,7 +318,7 @@ def _write_side_labels(
         if itr_ref:
             itr_cell.font = RED_FONT
 
-        if confidence in {"medium", "low"}:
+        if should_highlight_mapping(row.to_dict(), report_type=report_type):
             itr_cell.fill = REVIEW_FILL
             note_cell.fill = REVIEW_FILL
 

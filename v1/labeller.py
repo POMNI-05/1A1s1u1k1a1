@@ -12,6 +12,7 @@ from __future__ import annotations
 from importlib import import_module
 
 import pandas as pd
+from proto import module
 
 from job_config import get_policy_year
 
@@ -35,6 +36,33 @@ LABEL_COLUMNS = [
     "Recon ITR Ref",
 ]
 
+def _get_matcher():
+    """Return the year-specific ITR labelling function.
+    File naming rule:
+    - 2025 uses legacy v1/itr_rules.py
+    - 2026+ can use v1/itr_rules_<year>.py, e.g. itr_rules_2026.py
+    """
+    year = str(get_policy_year("2026")).strip()
+
+    if year == "2025":
+        module_name = "itr_rules"
+    else:
+        module_name = f"itr_rules_{year}"
+
+    try:
+        module = import_module(module_name)
+    except ModuleNotFoundError as exc:
+        raise ValueError(
+            f"No ITR rules module found for policy year {year}. "
+            f"Expected backend file: v1/{module_name}.py"
+        ) from exc
+
+    if not hasattr(module, "match_financial_label"):
+        raise AttributeError(
+            f"Rules module {module_name}.py does not define match_financial_label()."
+        )
+
+    return module.match_financial_label
 
 def get_account_col(df: pd.DataFrame) -> str:
     for wanted in ["account label", "account", "description", "account name"]:
@@ -117,7 +145,7 @@ def _net_profit_mapping() -> dict:
 
 def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
     out = df.copy()
-
+    match_financial_label = _get_matcher()
     if out.empty:
         return pd.concat(
             [out.reset_index(drop=True), pd.DataFrame(columns=LABEL_COLUMNS)],

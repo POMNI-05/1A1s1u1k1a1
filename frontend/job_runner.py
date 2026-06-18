@@ -24,11 +24,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
-
 # ── Paths ─────────────────────────────────────────────────────────────────────
 FRONTEND_DIR = Path(__file__).resolve().parent
 ROOT_DIR = FRONTEND_DIR.parent
 V1_DIR = ROOT_DIR / "v1"
+V1_JOB_CONFIG_PATH = V1_DIR / "job_config.json"
 
 UPLOADS_DIR = FRONTEND_DIR / "uploads"
 DOWNLOADS_DIR = FRONTEND_DIR / "downloads"
@@ -208,7 +208,200 @@ def _build_error_result(
 
 
 # ── Public function called by app.py ──────────────────────────────────────────
+def _normalise_requested_tables(requested_tables: dict[str, bool] | None) -> dict[str, bool]:
+    default_tables = {
+        "carry_forward_losses": False,
+        "rd_tax_incentive": False,
+        "div7a": False,
+        "fbt_entertainment": False,
+        "depreciation": False,
+        "superannuation": False,
+        "gst_reconciliation": False,
+        "related_party_loans": False,
+        "psi": False,
+    }
 
+    if not requested_tables:
+        return default_tables
+
+    for key, value in requested_tables.items():
+        if key in default_tables:
+            default_tables[key] = bool(value)
+
+    return default_tables
+
+
+def _build_job_options(
+    ato_policy_year: str = "2026",
+    requested_tables: dict[str, bool] | None = None,
+    reviewer_notes: str = "",
+    company_profile: str = "",
+    document_description: str = "",
+    client_name: str = "",
+) -> dict:
+    year = str(ato_policy_year or "2026").strip()
+
+    if year not in {"2024", "2025", "2026"}:
+        year = "2026"
+
+    return {
+        "ato_policy_year": year,
+        "itr_policy_year": year,
+        "requested_tables": _normalise_requested_tables(requested_tables),
+        "reviewer_notes": reviewer_notes or "",
+        "company_profile": company_profile or "",
+        "document_description": document_description or "",
+        "client_name": client_name or "",
+    }
+
+
+def _write_job_config(job_options: dict) -> Path:
+    """
+    Writes frontend-selected settings for v1/main.py, itr_rules.py, ato_policy.py,
+    workpaper_builder.py, etc.
+
+    Backend can read:
+        v1/job_config.json
+
+    Backend subprocess also receives:
+        ATO_POLICY_YEAR
+        ITR_POLICY_YEAR
+        TAX_JOB_CONFIG_PATH
+    """
+    V1_JOB_CONFIG_PATH.write_text(
+        json.dumps(job_options, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info("Wrote backend job config: %s", V1_JOB_CONFIG_PATH)
+    return V1_JOB_CONFIG_PATH
+
+
+def _summarise_workbook_for_ai(path: Path, max_rows_per_sheet: int = 40) -> str:
+    """
+    Creates a compact text summary of the generated workbook.
+    Do not send the whole workbook blindly to Gemini.
+    """
+    if load_workbook is None:
+        return "Workbook summary unavailable because openpyxl could not be imported."
+
+    if not path.exists():
+        return f"Workbook summary unavailable because file does not exist: {path}"
+
+    wb = load_workbook(path, data_only=True, read_only=True)
+    parts: list[str] = []
+
+    parts.append(f"Workbook: {path.name}")
+    parts.append(f"Sheets: {', '.join(wb.sheetnames)}")
+
+    for ws in wb.worksheets:
+        parts.append("")
+        parts.append(f"=== Sheet: {ws.title} ===")
+        parts.append(f"Max rows: {ws.max_row}, max columns: {ws.max_column}")
+
+        rows_added = 0
+        for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row, max_rows_per_sheet), values_only=True):
+            values = ["" if cell is None else str(cell) for cell in row]
+            joined = " | ".join(values).strip()
+
+            if joined:
+                parts.append(joined[:1200])
+                rows_added += 1
+
+            if rows_added >= max_rows_per_sheet:
+                break
+
+    return "\n".join(parts)[:60000]
+
+
+def _run_gemini_face_check(
+    job_options: dict,
+    backend_output: Path,
+    stdout: str = "",
+    stderr: str = "",
+) -> dict:
+    """
+    Optional AI review pass.
+
+    Requires:
+        pip install -U google-genai
+
+    Env:
+        GEMINI_API_KEY=...
+    """
+    if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+        return {
+            "status": "skipped",
+            "summary": (
+                "Gemini face-check skipped because GEMINI_API_KEY / GOOGLE_API_KEY "
+                "is not set in the environment."
+            ),
+        }
+
+    try:
+        from google import genai
+    except Exception as exc:
+        return {
+            "status": "skipped",
+            "summary": (
+                "Gemini face-check skipped because google-genai is not installed. "
+                "Install with: pip install -U google-genai\n\n"
+                f"Import error: {exc}"
+            ),
+        }
+
+    workbook_summary = _summarise_workbook_for_ai(backend_output)
+
+    prompt = f"""
+You are reviewing an Australian company tax workpaper generated from Xero reports.
+
+Your job:
+- Identify obvious issues on the face of the workpaper.
+- Check whether selected optional schedules appear relevant.
+- Check whether income/expense labels look unusual.
+- Check whether R&D, carry-forward losses, Div 7A, superannuation timing, depreciation, GST, PSI, and related-party loan matters need review.
+- Do not invent facts.
+- Do not give final tax advice.
+- Return concise accountant-review points.
+
+User-selected job options:
+{json.dumps(job_options, indent=2, ensure_ascii=False)}
+
+Backend stdout:
+{stdout[-8000:]}
+
+Backend stderr:
+{stderr[-8000:]}
+
+Generated workbook summary:
+{workbook_summary}
+
+Return format:
+1. Overall face-check result
+2. Possible issues
+3. Missing information / schedules to request
+4. High-priority review points
+5. Low-priority observations
+"""
+
+    try:
+        client = genai.Client()
+        response = client.models.generate_content(
+            model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash"),
+            contents=prompt,
+        )
+
+        return {
+            "status": "success",
+            "summary": response.text or "Gemini returned an empty response.",
+        }
+
+    except Exception as exc:
+        logger.exception("Gemini face-check failed")
+        return {
+            "status": "error",
+            "summary": f"Gemini face-check failed: {type(exc).__name__}: {exc}",
+        }
+    
 def run_workpaper_job(
     extra_files: BinaryIO | list[BinaryIO] | None = None,
     pl_file: BinaryIO | list[BinaryIO] | None = None,

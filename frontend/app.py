@@ -2,12 +2,10 @@
 """
 ICGTAX Tax Workpaper Generator — Streamlit UI.
 
-Run from project root:
-    streamlit run frontend/app.py
+Run from project root: streamlit run frontend/app.py
 
 Design:
-- One upload box only.
-- User can upload one combined workbook or multiple Excel files.
+- One upload box only -> User can upload one combined workbook or multiple Excel files.
 - Frontend does not decide which file is P&L or Balance Sheet.
 - job_runner copies files into v1/data/.
 - v1/main.py runs exactly like the working backend test.
@@ -29,10 +27,23 @@ if str(FRONTEND_DIR) not in sys.path:
 import ui_text as T
 from job_runner import run_workpaper_job
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Revision question handler
 # ─────────────────────────────────────────────────────────────────────────────
+ATO_POLICY_YEARS = ["2026", "2025", "2024"]
+
+OPTIONAL_TABLES = {
+    "carry_forward_losses": "Carry-forward tax loss table",
+    "rd_tax_incentive": "R&D tax incentive table",
+    "div7a": "Division 7A / shareholder loan table",
+    "fbt_entertainment": "FBT / entertainment review table",
+    "depreciation": "Tax depreciation / capital allowance table",
+    "superannuation": "Superannuation timing table",
+    "gst_reconciliation": "GST / BAS reconciliation table",
+    "related_party_loans": "Related party loan table",
+    "psi": "PSI / personal services income review table",
+}
+
 
 def _handle_revision_question(question: str, result: dict) -> str:
     q = question.lower()
@@ -299,6 +310,51 @@ with left:
     # ── Document description ─────────────────────────────────────────────────
     st.markdown(f'<div class="section-header">{T.SECTION_DESCRIBE}</div>', unsafe_allow_html=True)
 
+    ato_policy_year = st.selectbox(
+        "ATO / ITR policy year",
+        options=ATO_POLICY_YEARS,
+        index=0,
+        help="This will be passed to the backend so itr_rules / ato_policy can switch rule sets.",
+    )
+
+    st.caption("Optional review tables to include / prepare")
+
+    requested_tables: dict[str, bool] = {}
+
+    table_col_1, table_col_2 = st.columns(2)
+
+    for idx, (table_key, table_label) in enumerate(OPTIONAL_TABLES.items()):
+        target_col = table_col_1 if idx % 2 == 0 else table_col_2
+        with target_col:
+            requested_tables[table_key] = st.checkbox(
+                table_label,
+                value=table_key in {
+                    "carry_forward_losses",
+                    "rd_tax_incentive",
+                    "depreciation",
+                    "superannuation",
+                },
+                key=f"table_{table_key}",
+            )
+
+    reviewer_notes = st.text_area(
+        "Reviewer instructions / special facts",
+        placeholder=(
+            "Example: Prior-year tax losses exist; R&D claim expected; "
+            "director loan may need Div 7A review; check consulting income classification."
+        ),
+        height=80,
+    )
+
+    run_ai_face_check = st.checkbox(
+        "Run Gemini face-check after workbook generation",
+        value=True,
+        help=(
+            "Sends user inputs + a workbook summary to Gemini to identify obvious issues. "
+            "It should not replace accountant review."
+        ),
+    )
+
     document_description = st.text_area(
         T.DOC_DESCRIPTION_LABEL,
         placeholder=T.DOC_DESCRIPTION_PLACEHOLDER,
@@ -325,8 +381,11 @@ with left:
                     company_profile=company_profile,
                     document_description=document_description,
                     client_name=client_name,
+                    ato_policy_year=ato_policy_year,
+                    requested_tables=requested_tables,
+                    reviewer_notes=reviewer_notes,
+                    run_ai_face_check=run_ai_face_check,
                 )
-
             st.session_state.job_result = result
             st.session_state.revision_response = None
             st.rerun()

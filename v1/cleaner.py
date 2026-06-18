@@ -647,8 +647,15 @@ def _detect_amount_col(df: pd.DataFrame) -> str:
 def _normalised_name(value: str) -> str:
     return normalise_match_text(value)
 
-
 def add_row_type(df: pd.DataFrame, account_col: str, amount_cols: list[str]) -> pd.DataFrame:
+    """
+    Classify each cleaned row.
+
+    Main goal:
+    - headings/sections are structure only
+    - totals are check/result rows
+    - actual accounts are the only rows that should be mapped by rules
+    """
     out = df.copy()
 
     heading_names = {
@@ -656,14 +663,16 @@ def add_row_type(df: pd.DataFrame, account_col: str, amount_cols: list[str]) -> 
         "trading income",
         "income",
         "revenue",
-
+        "sales",
+        "operating revenue",
+        "other revenue",
+        "other income",
         "less cost of sales",
         "cost of sales",
         "cost of goods sold",
-
-        "plus other income",
-        "other income",
-
+        "cogs",
+        "direct costs",
+        "gross profit",
         "less operating expenses",
         "operating expenses",
         "expenses",
@@ -672,17 +681,31 @@ def add_row_type(df: pd.DataFrame, account_col: str, amount_cols: list[str]) -> 
         "assets",
         "current assets",
         "non-current assets",
+        "non current assets",
         "fixed assets",
+        "property plant and equipment",
         "liabilities",
         "current liabilities",
         "non-current liabilities",
+        "non current liabilities",
         "equity",
-        "bank",
+        "shareholders equity",
+        "shareholder equity",
+        "owners equity",
     }
 
     total_exact = {
         # P&L totals
-        "gross profit",
+        "total income",
+        "total revenue",
+        "total sales",
+        "total trading income",
+        "total cost of sales",
+        "total cogs",
+        "total direct costs",
+        "total other income",
+        "total operating expenses",
+        "total expenses",
         "net profit",
         "net loss",
         "net profit / loss",
@@ -690,12 +713,6 @@ def add_row_type(df: pd.DataFrame, account_col: str, amount_cols: list[str]) -> 
         "profit before tax",
         "accounting profit before tax",
         "net profit after tax",
-        "total income",
-        "total trading income",
-        "total cost of sales",
-        "total other income",
-        "total operating expenses",
-        "total expenses",
 
         # Balance Sheet totals
         "net assets",
@@ -703,8 +720,18 @@ def add_row_type(df: pd.DataFrame, account_col: str, amount_cols: list[str]) -> 
         "total liabilities",
         "total equity",
         "total current assets",
+        "total non-current assets",
+        "total non current assets",
         "total current liabilities",
+        "total non-current liabilities",
+        "total non current liabilities",
     }
+
+    def has_amount(row) -> bool:
+        for col in amount_cols:
+            if abs(clean_amount(row.get(col, 0.0))) > 0.005:
+                return True
+        return False
 
     def row_type(row) -> str:
         text = _normalised_name(row.get(account_col, ""))
@@ -712,31 +739,45 @@ def add_row_type(df: pd.DataFrame, account_col: str, amount_cols: list[str]) -> 
         if text in {"", "nan", "none"}:
             return "blank"
 
+        if text in total_exact or text.startswith("total "):
+            return "total"
+
         if text in heading_names:
             return "heading"
 
-        if text in total_exact or text.startswith("total "):
-            return "total"
+        # Rows with no amounts and very short structural names are probably headings/notes.
+        if not has_amount(row):
+            if len(text.split()) <= 5 and not re.search(r"\d", text):
+                return "heading"
+            return "note"
 
         return "account"
 
     out["Row Type"] = out.apply(row_type, axis=1)
     return out
 
+
 def add_report_section(df: pd.DataFrame, account_col: str) -> pd.DataFrame:
+    """
+    Carry down the most recent heading as Report Section.
+
+    For total rows such as Gross Profit / Net Profit, keep the previous section.
+    """
     out = df.copy()
     current = ""
-    sections = []
+    sections: list[str] = []
 
     for _, row in out.iterrows():
-        if normalise_match_text(row.get("Row Type", "")) == "heading":
-            current = normalise_text(row.get(account_col, ""))
+        row_type = normalise_match_text(row.get("Row Type", ""))
+        label = normalise_text(row.get(account_col, ""))
+
+        if row_type == "heading":
+            current = label
 
         sections.append(current)
 
     out["Report Section"] = sections
     return out
-
 
 def _table_from_raw_df(raw_df: pd.DataFrame, start_row: int) -> pd.DataFrame:
     header = raw_df.iloc[start_row].tolist()

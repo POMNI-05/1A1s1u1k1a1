@@ -24,34 +24,19 @@ from labeller import label_report, extract_review_items
 
 logger = logging.getLogger(__name__)
 
-# make sure its build_workpaper() signature accepts reports
-def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
-    if reports is None:
-        reports = load_clean_report_bundle()
-
-    clean_pl_df = reports.clean_pl
-    clean_bs_df = reports.clean_bs
-
-    labelled_pl = label_report(clean_pl_df, "profit_and_loss")
-    labelled_bs = label_report(clean_bs_df, "balance_sheet")
-
-    tax_reconciliation = _build_tax_reconciliation(
-        clean_pl_df,
-        labelled_pl,
-        tax_depreciation_total=reports.tax_depreciation_total,
-        tax_depreciation_source=reports.tax_depreciation_source,
-    )
-
 @dataclass
 class Workpaper:
     labelled_pl: pd.DataFrame
     labelled_bs: pd.DataFrame
+
+    pl_label_summary: pd.DataFrame
+    bs_label_summary: pd.DataFrame
+
     tax_reconciliation: pd.DataFrame
     carry_forward_losses: pd.DataFrame
     rd_breakdown: pd.DataFrame
     bs_checks: pd.DataFrame
     review_items: pd.DataFrame
-
 
 def _get_account_col(df: pd.DataFrame) -> str:
     for col in df.columns:
@@ -67,6 +52,7 @@ def _detect_amount_cols(df: pd.DataFrame) -> list[str]:
         "report section",
         "itr ref",
         "itr label",
+        "workpaper label",
         "treatment",
         "confidence",
         "review note",
@@ -108,6 +94,119 @@ def _detect_amount_cols(df: pd.DataFrame) -> list[str]:
 
     return amount_cols
 
+def _build_label_summary(
+    labelled_df: pd.DataFrame,
+    report_name: str,
+    include_support_only: bool = False,
+) -> pd.DataFrame:
+    """
+    Build a review-friendly summary of labels and totals.
+
+    This summarises by Workpaper Label, not only ITR Ref.
+    That means label-only rows such as:
+    - Operating expense
+    - Cash / bank support
+    - Current asset support
+    still appear in the summary.
+    """
+    columns = [
+        "Source",
+        "Workpaper Label",
+        "ITR Ref",
+        "ITR Label",
+        "Amount",
+        "Confidence",
+        "Treatment",
+        "Review Note",
+        "Source Rows",
+    ]
+
+    if labelled_df is None or labelled_df.empty:
+        return pd.DataFrame(columns=columns)
+
+    amount_cols = _detect_amount_cols(labelled_df)
+    if not amount_cols:
+        return pd.DataFrame(columns=columns)
+
+    amount_col = amount_cols[0]
+    rows = labelled_df.copy()
+
+    if "Row Type" in rows.columns:
+        rows = rows[
+            rows["Row Type"].astype(str).str.lower().isin(["account", "total"])
+        ].copy()
+
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    for col in [
+        "Workpaper Label",
+        "ITR Ref",
+        "ITR Label",
+        "Treatment",
+        "Confidence",
+        "Review Note",
+    ]:
+        if col not in rows.columns:
+            rows[col] = ""
+
+        rows[col] = rows[col].astype(str).str.strip()
+
+    rows = rows[rows["Workpaper Label"].ne("")].copy()
+    rows = rows[rows["ITR Ref"].ne("Review")].copy()
+
+    if not include_support_only:
+        rows = rows[~rows["Treatment"].str.lower().eq("support_only")].copy()
+
+    if rows.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows["_Amount"] = rows[amount_col].apply(clean_amount)
+
+    grouped = (
+        rows.groupby(
+            ["Workpaper Label", "ITR Ref", "ITR Label", "Treatment"],
+            dropna=False,
+        )
+        .agg(
+            Amount=("_Amount", "sum"),
+            Confidence=("Confidence", lambda s: _worst_confidence(s.tolist())),
+            Review_Note=("Review Note", lambda s: "; ".join(sorted({x for x in s if x}))),
+            Source_Rows=("Source Row", lambda s: ", ".join(str(int(x)) for x in s if pd.notna(x))),
+        )
+        .reset_index()
+    )
+
+    grouped.insert(0, "Source", report_name)
+    grouped = grouped.rename(
+        columns={
+            "Review_Note": "Review Note",
+            "Source_Rows": "Source Rows",
+        }
+    )
+
+    return grouped[columns]
+
+def _worst_confidence(values: list[str]) -> str:
+    """
+    Conservative confidence roll-up.
+
+    If any row is low, the whole label total is low.
+    If any row is medium, the whole label total is medium.
+    Otherwise high.
+    """
+    cleaned = {str(v).strip().lower() for v in values if str(v).strip()}
+
+    if "low" in cleaned:
+        return "low"
+
+    if "medium" in cleaned:
+        return "medium"
+
+    if "high" in cleaned:
+        return "high"
+
+    return ""
 
 def _row_names(df: pd.DataFrame, account_col: str) -> pd.Series:
     return (
@@ -674,8 +773,18 @@ def _build_tax_depreciation_review_item(reports: CleanedReports) -> pd.DataFrame
         }
     ])
 
-
 def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
+    """
+    Build all output data blocks.
+
+    Structure:
+    - P&L evidence copied to its own tab.
+    - BS evidence copied to its own tab.
+    - Tax Reconciliation sheet contains:
+      1. P&L block + side labels + P&L label summary
+      2. BS block + side labels + BS label summary
+      3. final tax reconciliation table
+    """
     if reports is None:
         reports = load_clean_report_bundle()
 
@@ -684,6 +793,18 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
 
     labelled_pl = label_report(clean_pl_df, "profit_and_loss")
     labelled_bs = label_report(clean_bs_df, "balance_sheet")
+
+    pl_label_summary = _build_label_summary(
+        labelled_pl,
+        report_name="P&L",
+        include_support_only=False,
+    )
+
+    bs_label_summary = _build_label_summary(
+        labelled_bs,
+        report_name="BS",
+        include_support_only=False,
+    )
 
     tax_reconciliation = _build_tax_reconciliation(
         clean_pl_df,
@@ -697,22 +818,37 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
     carry_forward_losses = pd.DataFrame(CARRY_FORWARD_LOSSES_TEMPLATE)
     rd_breakdown = pd.DataFrame(RD_BREAKDOWN_TEMPLATE)
 
-    review_items = pd.concat(
-        [
-            extract_review_items(labelled_pl, "P&L"),
-            extract_review_items(labelled_bs, "BS"),
-            _build_tax_depreciation_review_item(reports),
-        ],
-        ignore_index=True,
-    )
+    review_blocks = [
+        extract_review_items(labelled_pl, "P&L"),
+        extract_review_items(labelled_bs, "BS"),
+        _build_tax_depreciation_review_item(reports),
+    ]
+
+    review_blocks = [df for df in review_blocks if df is not None and not df.empty]
+
+    if review_blocks:
+        review_items = pd.concat(review_blocks, ignore_index=True)
+    else:
+        review_items = pd.DataFrame(
+            columns=[
+                "Source",
+                "Section",
+                "Account",
+                "ITR Ref",
+                "Recon ITR Ref",
+                "Review Note",
+                "Reason",
+            ]
+        )
 
     return Workpaper(
         labelled_pl=labelled_pl,
         labelled_bs=labelled_bs,
+        pl_label_summary=pl_label_summary,
+        bs_label_summary=bs_label_summary,
         tax_reconciliation=tax_reconciliation,
         carry_forward_losses=carry_forward_losses,
         rd_breakdown=rd_breakdown,
         bs_checks=bs_checks,
         review_items=review_items,
     )
-

@@ -182,26 +182,85 @@ def _copy_merged_ranges(src_ws, dst_ws, row_offset: int = 0, col_offset: int = 0
             end_column=max_col + col_offset,
         )
 
+def _looks_like_generated_column(src_ws, col_idx: int) -> bool:
+    """
+    Detect generated helper columns from old output files.
+
+    If a user accidentally uploads a prior generated workbook, we do not want
+    the copied Profit and Loss / Balance Sheet evidence tabs to include:
+    - ITR Label
+    - ITR Ref
+    - Review note
+    - ITR Totals
+    - yellow summary blocks
+    """
+    values = []
+
+    for row_idx in range(1, min(src_ws.max_row, 40) + 1):
+        value = src_ws.cell(row_idx, col_idx).value
+        if value is None:
+            continue
+        values.append(str(value).strip().lower())
+
+    joined = " | ".join(values)
+
+    generated_markers = [
+        "itr label",
+        "itr ref",
+        "itr totals",
+        "review note",
+        "tax reconciliation",
+        "total income",
+        "total expenses",
+        "pre tax profit",
+        "pre tax profit/(loss)",
+    ]
+
+    return any(marker in joined for marker in generated_markers)
 
 def _copy_sheet_to_workbook(report_input: ReportInput, dst_wb: Workbook, title: str):
-    """Copy selected original source sheet into output workbook."""
+    """
+    Copy selected original source sheet into output workbook.
+
+    This version keeps the raw evidence sheet clean. If the source file is
+    accidentally a previous generated output workbook, it skips generated
+    helper columns such as ITR Label / ITR Totals / Review note.
+    """
     _, src_ws = _get_source_ws(report_input)
     dst_ws = dst_wb.create_sheet(title)
 
+    allowed_cols = [
+        col_idx
+        for col_idx in range(1, src_ws.max_column + 1)
+        if not _looks_like_generated_column(src_ws, col_idx)
+    ]
+
+    col_map = {
+        old_col_idx: new_col_idx
+        for new_col_idx, old_col_idx in enumerate(allowed_cols, start=1)
+    }
+
     for row in src_ws.iter_rows():
         for src_cell in row:
-            dst_cell = dst_ws.cell(src_cell.row, src_cell.column)
+            if src_cell.column not in col_map:
+                continue
+
+            dst_cell = dst_ws.cell(src_cell.row, col_map[src_cell.column])
             _copy_cell(src_cell, dst_cell)
 
-    for col_letter, dim in src_ws.column_dimensions.items():
-        dst_ws.column_dimensions[col_letter].width = dim.width
+    for old_col_idx, new_col_idx in col_map.items():
+        src_letter = get_column_letter(old_col_idx)
+        dst_letter = get_column_letter(new_col_idx)
+        dst_ws.column_dimensions[dst_letter].width = (
+            src_ws.column_dimensions[src_letter].width or 12
+        )
 
     for row_idx, dim in src_ws.row_dimensions.items():
         if dim.height is not None:
             dst_ws.row_dimensions[row_idx].height = dim.height
 
-    _copy_merged_ranges(src_ws, dst_ws)
-
+    # Do not copy merged ranges here, because generated columns may be skipped
+    # and old merged ranges can become invalid. Raw values/styles are enough.
     dst_ws.freeze_panes = src_ws.freeze_panes
     dst_ws.sheet_view.showGridLines = src_ws.sheet_view.showGridLines
 
@@ -272,7 +331,7 @@ def _write_side_labels(
     review_col: int,
     report_type: str = "",
 ) -> None:
-    ws.cell(source_start_row, itr_col, "ITR Ref")
+    ws.cell(source_start_row, itr_col, "ITR Label")
     ws.cell(source_start_row, review_col, "Review note")
 
     for cell in (ws.cell(source_start_row, itr_col), ws.cell(source_start_row, review_col)):
@@ -280,27 +339,23 @@ def _write_side_labels(
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=False)
 
+    if labelled_df is None or labelled_df.empty:
+        return
+
     for _, row in labelled_df.iterrows():
         source_row = row.get("Source Row")
 
         if pd.isna(source_row):
             continue
 
-        row_type = str(row.get("Row Type", "")).lower()
+        row_type = str(row.get("Row Type", "") or "").lower().strip()
         if row_type not in {"account", "total"}:
             continue
 
         itr_ref = str(row.get("ITR Ref", "") or "").strip()
         review_note = str(row.get("Review Note", "") or "").strip()
         label_reason = str(row.get("Label Reason", "") or "").strip()
-        confidence = str(row.get("Confidence", "") or "").lower()
-
-        treatment = str(row.get("Treatment", "") or "").lower()
-        if not itr_ref and treatment == "support_only":
-            continue
-        
-        if not itr_ref and confidence not in {"medium", "low"}:
-            continue
+        confidence = str(row.get("Confidence", "") or "").lower().strip()
 
         if not itr_ref and not review_note and not label_reason:
             continue
@@ -311,19 +366,18 @@ def _write_side_labels(
         if label_reason and confidence in {"medium", "low"}:
             visible_note = f"{review_note} {label_reason}".strip()
 
-        itr_cell = ws.cell(excel_row, itr_col, itr_ref)
+        label_cell = ws.cell(excel_row, itr_col, itr_ref)
         note_cell = ws.cell(excel_row, review_col, visible_note)
+
+        label_cell.font = RED_FONT if itr_ref else REVIEW_NOTE_FONT
+        label_cell.alignment = Alignment(vertical="top", wrap_text=False)
+
         note_cell.font = REVIEW_NOTE_FONT
-
-        if itr_ref:
-            itr_cell.font = RED_FONT
-
-        if should_highlight_mapping(row.to_dict(), report_type=report_type):
-            itr_cell.fill = REVIEW_FILL
-            note_cell.fill = REVIEW_FILL
-
         note_cell.alignment = Alignment(vertical="top", wrap_text=False)
 
+        if should_highlight_mapping(row.to_dict(), report_type=report_type):
+            label_cell.fill = REVIEW_FILL
+            note_cell.fill = REVIEW_FILL
 
 def _write_tax_reconciliation_table(
     ws,
@@ -401,7 +455,246 @@ def _write_tax_reconciliation_table(
             ws.column_dimensions[letter].width = 12
 
     return header_row + len(df), last_col
+PL_INCOME_SUMMARY_LABELS = [
+    "Inc - 6A",
+    "Inc - 6B",
+    "Inc - 6C",
+    "Inc - 6D",
+    "Inc - 6E",
+    "Inc - 6X",
+    "Inc - 6F",
+    "Inc - 6G",
+    "Inc - 6H",
+    "Inc - 6I",
+    "Inc - 6Q",
+    "Inc - 6J",
+    "Inc - 6R",
+]
 
+PL_EXPENSE_SUMMARY_LABELS = [
+    "Exp - 6A",
+    "Exp - 6C",
+    "Exp - 6D",
+    "Exp - 6E",
+    "Exp - 6F",
+    "Exp - 6I",
+    "Exp - 6H",
+    "Exp - 6V",
+    "Exp - 6J",
+    "Exp - 6U",
+    "Exp - 6W",
+    "Exp - 6X",
+    "Exp - 6Y",
+    "Exp - 6Z",
+    "Exp - 6G",
+    "Exp - 6S",
+]
+
+def _find_main_amount_col(ws, start_row: int, last_row: int, last_col: int) -> int:
+    """
+    Find the main numeric amount column in the copied report block.
+
+    Usually this is column B, but this is safer than hard-coding B.
+    """
+    best_col = 2
+    best_count = -1
+
+    for col_idx in range(1, last_col + 1):
+        count = 0
+
+        for row_idx in range(start_row, last_row + 1):
+            value = ws.cell(row_idx, col_idx).value
+
+            if _is_number(value):
+                count += 1
+
+        if count > best_count:
+            best_count = count
+            best_col = col_idx
+
+    return best_col
+
+
+def _write_pl_formula_summary_table(
+    ws,
+    title: str,
+    start_row: int,
+    start_col: int,
+    label_col: int,
+    amount_col: int,
+    data_start_row: int,
+    data_last_row: int,
+) -> tuple[int, int]:
+    """
+    Write P&L ITR totals using Excel formulas.
+
+    Formula pattern:
+    =SUMIF($<label_col>$start:$<label_col>$end, <summary_label_cell>, $<amount_col>$start:$<amount_col>$end)
+    """
+    label_letter = get_column_letter(label_col)
+    amount_letter = get_column_letter(amount_col)
+
+    label_range = f"${label_letter}${data_start_row}:${label_letter}${data_last_row}"
+    amount_range = f"${amount_letter}${data_start_row}:${amount_letter}${data_last_row}"
+
+    label_out_col = start_col
+    amount_out_col = start_col + 1
+
+    # Title/header
+    ws.cell(start_row, label_out_col, title)
+    ws.cell(start_row, label_out_col).fill = SECTION_FILL
+    ws.cell(start_row, label_out_col).font = BOLD_FONT
+
+    ws.cell(start_row, amount_out_col, "Amount")
+    ws.cell(start_row, amount_out_col).fill = SECTION_FILL
+    ws.cell(start_row, amount_out_col).font = BOLD_FONT
+
+    current_row = start_row + 2
+
+    income_amount_cells = []
+    expense_amount_cells = []
+
+    # Income section
+    ws.cell(current_row, label_out_col, "Income")
+    ws.cell(current_row, label_out_col).font = BOLD_FONT
+    current_row += 1
+
+    for label in PL_INCOME_SUMMARY_LABELS:
+        label_cell = ws.cell(current_row, label_out_col, label)
+        amount_cell = ws.cell(current_row, amount_out_col)
+
+        amount_cell.value = f"=SUMIF({label_range},{label_cell.coordinate},{amount_range})"
+        amount_cell.number_format = '$#,##0.00;($#,##0.00);-'
+
+        income_amount_cells.append(amount_cell.coordinate)
+        current_row += 1
+
+    total_income_row = current_row
+    ws.cell(total_income_row, label_out_col, "TOTAL INCOME")
+    ws.cell(total_income_row, label_out_col).font = BOLD_FONT
+    ws.cell(total_income_row, amount_out_col, f"=SUM({','.join(income_amount_cells)})")
+    ws.cell(total_income_row, amount_out_col).number_format = '$#,##0.00;($#,##0.00);-'
+    ws.cell(total_income_row, amount_out_col).font = BOLD_FONT
+
+    current_row += 3
+
+    # Expense section
+    ws.cell(current_row, label_out_col, "Expenses")
+    ws.cell(current_row, label_out_col).font = BOLD_FONT
+    current_row += 1
+
+    for label in PL_EXPENSE_SUMMARY_LABELS:
+        label_cell = ws.cell(current_row, label_out_col, label)
+        amount_cell = ws.cell(current_row, amount_out_col)
+
+        amount_cell.value = f"=SUMIF({label_range},{label_cell.coordinate},{amount_range})"
+        amount_cell.number_format = '$#,##0.00;($#,##0.00);-'
+
+        expense_amount_cells.append(amount_cell.coordinate)
+        current_row += 1
+
+    total_expense_row = current_row
+    ws.cell(total_expense_row, label_out_col, "TOTAL EXPENSES")
+    ws.cell(total_expense_row, label_out_col).font = BOLD_FONT
+    ws.cell(total_expense_row, amount_out_col, f"=SUM({','.join(expense_amount_cells)})")
+    ws.cell(total_expense_row, amount_out_col).number_format = '$#,##0.00;($#,##0.00);-'
+    ws.cell(total_expense_row, amount_out_col).font = BOLD_FONT
+
+    current_row += 2
+
+    # Pre-tax profit
+    pre_tax_row = current_row
+    ws.cell(pre_tax_row, label_out_col, "PRE TAX PROFIT/(LOSS)")
+    ws.cell(pre_tax_row, label_out_col).font = BOLD_FONT
+    ws.cell(
+        pre_tax_row,
+        amount_out_col,
+        f"={ws.cell(total_income_row, amount_out_col).coordinate}-{ws.cell(total_expense_row, amount_out_col).coordinate}",
+    )
+    ws.cell(pre_tax_row, amount_out_col).number_format = '$#,##0.00;($#,##0.00);-'
+    ws.cell(pre_tax_row, amount_out_col).font = BOLD_FONT
+
+    # Format yellow block
+    for row_idx in range(start_row, pre_tax_row + 1):
+        for col_idx in range(label_out_col, amount_out_col + 1):
+            ws.cell(row_idx, col_idx).fill = SECTION_FILL
+
+    ws.column_dimensions[get_column_letter(label_out_col)].width = 18
+    ws.column_dimensions[get_column_letter(amount_out_col)].width = 16
+
+    return pre_tax_row, amount_out_col
+
+def _write_label_summary_table(
+    ws,
+    df: pd.DataFrame,
+    title: str,
+    start_row: int,
+    start_col: int,
+) -> tuple[int, int]:
+    """
+    Write P&L or BS label summary table.
+
+    This is the system-generated equivalent of the old yellow SUMIF table,
+    but safer because it comes from labelled dataframe results rather than
+    hard-coded Excel column letters like E:E or F:F.
+    """
+    if df is None or df.empty:
+        ws.cell(start_row, start_col, title)
+        ws.cell(start_row + 1, start_col, "No labels detected")
+        ws.cell(start_row, start_col).fill = TITLE_FILL
+        ws.cell(start_row, start_col).font = TITLE_FONT
+        return start_row + 1, start_col
+
+    display_df = df.copy()
+
+    last_col = start_col + len(display_df.columns) - 1
+
+    for col in range(start_col, last_col + 1):
+        ws.cell(start_row, col).fill = TITLE_FILL
+        ws.cell(start_row, col).font = TITLE_FONT
+
+    ws.cell(start_row, start_col, title)
+
+    header_row = start_row + 1
+
+    for idx, col_name in enumerate(display_df.columns):
+        cell = ws.cell(header_row, start_col + idx, col_name)
+        cell.fill = HEADER_FILL
+        cell.font = HEADER_FONT
+        cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=False)
+
+    for r_idx, (_, row) in enumerate(display_df.iterrows(), start=header_row + 1):
+        for c_idx, col_name in enumerate(display_df.columns):
+            value = _safe(row[col_name])
+            cell = ws.cell(r_idx, start_col + c_idx, value)
+            cell.alignment = Alignment(vertical="top", wrap_text=False)
+            cell.border = THIN_BORDER
+
+            if col_name == "Amount" and _is_number(value):
+                cell.number_format = '$#,##0.00;($#,##0.00);-'
+
+            if col_name == "ITR Ref" and str(value or "").strip():
+                cell.font = RED_FONT
+
+            confidence = str(row.get("Confidence", "") or "").lower()
+            treatment = str(row.get("Treatment", "") or "").lower()
+
+            if confidence in {"low", "medium"} or treatment == "review_only":
+                cell.fill = REVIEW_FILL
+
+    for c_idx, col_name in enumerate(display_df.columns, start=start_col):
+        letter = get_column_letter(c_idx)
+
+        if col_name in {"ITR Label", "Review Note"}:
+            ws.column_dimensions[letter].width = 34
+        elif col_name == "Source Rows":
+            ws.column_dimensions[letter].width = 18
+        elif col_name == "Amount":
+            ws.column_dimensions[letter].width = 16
+        else:
+            ws.column_dimensions[letter].width = 14
+
+    return header_row + len(display_df), last_col
 
 def _write_simple_table(
     ws,
@@ -412,14 +705,17 @@ def _write_simple_table(
     input_table: bool = False,
 ) -> tuple[int, int]:
     if df is None or df.empty:
-        ws.cell(start_row, start_col, title)
+        title_cell = ws.cell(start_row, start_col, title)
+        title_cell.fill = TITLE_FILL
+        title_cell.font = TITLE_FONT
         return start_row, start_col
 
     last_col = start_col + len(df.columns) - 1
 
     for col in range(start_col, last_col + 1):
-        ws.cell(start_row, col).fill = TITLE_FILL
-        ws.cell(start_row, col).font = TITLE_FONT
+        cell = ws.cell(start_row, col)
+        cell.fill = TITLE_FILL
+        cell.font = TITLE_FONT
 
     ws.cell(start_row, start_col, title)
 
@@ -429,7 +725,7 @@ def _write_simple_table(
         cell = ws.cell(header_row, start_col + idx, str(col_name))
         cell.fill = HEADER_FILL
         cell.font = HEADER_FONT
-        cell.alignment = Alignment(horizontal="center", wrap_text=False)
+        cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=False)
 
     for r_idx, (_, row) in enumerate(df.iterrows(), start=header_row + 1):
         for c_idx, col_name in enumerate(df.columns):
@@ -445,10 +741,19 @@ def _write_simple_table(
                 cell.number_format = '$#,##0.00;($#,##0.00);-'
 
     for c_idx, col_name in enumerate(df.columns, start=start_col):
-        ws.column_dimensions[get_column_letter(c_idx)].width = min(max(12, len(str(col_name)) + 4), 28)
+        letter = get_column_letter(c_idx)
+        lower = str(col_name).strip().lower()
+
+        if lower in {"review note", "reason", "label reason"}:
+            ws.column_dimensions[letter].width = 38
+        elif lower in {"description", "account", "workpaper label", "itr label"}:
+            ws.column_dimensions[letter].width = 30
+        elif lower == "source rows":
+            ws.column_dimensions[letter].width = 16
+        else:
+            ws.column_dimensions[letter].width = 14
 
     return header_row + len(df), last_col
-
 
 def _write_bs_checks(ws, bs_checks: pd.DataFrame, start_row: int, start_col: int = 1) -> int:
     if bs_checks is None or bs_checks.empty:
@@ -490,8 +795,14 @@ def write_workbook(reports, workpaper) -> None:
 
     ws = wb.create_sheet(SHEET_RECONCILIATION)
 
-    # Reconciliation sheet: copy original formatted P&L and BS blocks.
+        # ------------------------------------------------------------------
+    # 1. P&L block with side labels
+    # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+    # 1. P&L block with ITR labels immediately beside P&L
+    # ------------------------------------------------------------------
     pl_start_row = 1
+
     pl_last_row, pl_last_col = _copy_report_area(
         reports.pl_input,
         ws,
@@ -500,7 +811,48 @@ def write_workbook(reports, workpaper) -> None:
         copy_formulas=True,
     )
 
-    bs_start_row = pl_last_row + 3
+    pl_itr_col = pl_last_col + 2
+    pl_review_col = pl_last_col + 3
+
+    ws.column_dimensions[get_column_letter(pl_itr_col)].width = 14
+    ws.column_dimensions[get_column_letter(pl_review_col)].width = 42
+
+    _write_side_labels(
+        ws,
+        workpaper.labelled_pl,
+        pl_start_row,
+        pl_itr_col,
+        pl_review_col,
+        report_type="profit_and_loss",
+    )
+
+    # Formula summary table goes beside the same P&L block.
+    # It does not depend on BS length.
+    pl_amount_col = _find_main_amount_col(
+        ws,
+        start_row=pl_start_row,
+        last_row=pl_last_row,
+        last_col=pl_last_col,
+    )
+
+    pl_summary_col = pl_review_col + 2
+
+    pl_summary_last_row, pl_summary_last_col = _write_pl_formula_summary_table(
+        ws,
+        title="ITR Totals",
+        start_row=pl_start_row,
+        start_col=pl_summary_col,
+        label_col=pl_itr_col,
+        amount_col=pl_amount_col,
+        data_start_row=pl_start_row,
+        data_last_row=pl_last_row,
+    )
+
+    # ------------------------------------------------------------------
+    # 2. BS block underneath P&L
+    # ------------------------------------------------------------------
+    bs_start_row = max(pl_last_row, pl_summary_last_row) + 4
+
     bs_last_row, bs_last_col = _copy_report_area(
         reports.bs_input,
         ws,
@@ -509,35 +861,56 @@ def write_workbook(reports, workpaper) -> None:
         copy_formulas=True,
     )
 
-    raw_last_col = max(pl_last_col, bs_last_col)
+    bs_itr_col = bs_last_col + 2
+    bs_review_col = bs_last_col + 3
 
-    itr_col = raw_last_col + 2
-    review_col = raw_last_col + 3
+    ws.column_dimensions[get_column_letter(bs_itr_col)].width = 14
+    ws.column_dimensions[get_column_letter(bs_review_col)].width = 42
 
-    ws.column_dimensions[get_column_letter(itr_col)].width = 16
-    ws.column_dimensions[get_column_letter(review_col)].width = 45
-
-    _write_side_labels(ws, workpaper.labelled_pl, pl_start_row, itr_col, review_col)
-    _write_side_labels(ws, workpaper.labelled_bs, bs_start_row, itr_col, review_col)
-
-    _write_bs_checks(ws, workpaper.bs_checks, bs_last_row + 2, 1)
-
-    tax_start_col = review_col + 3
-    _, tax_last_col = _write_tax_reconciliation_table(
+    _write_side_labels(
         ws,
-        workpaper.tax_reconciliation,
-        "Tax Reconciliation",
-        1,
-        tax_start_col,
+        workpaper.labelled_bs,
+        bs_start_row,
+        bs_itr_col,
+        bs_review_col,
+        report_type="balance_sheet",
     )
 
+    # ------------------------------------------------------------------
+    # 3. BS checks underneath BS
+    # ------------------------------------------------------------------
+    bs_checks_start_row = bs_last_row + 3
+
+    bs_checks_last_row = _write_bs_checks(
+        ws,
+        workpaper.bs_checks,
+        bs_checks_start_row,
+        1,
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Final tax reconciliation table underneath BS checks
+    # ------------------------------------------------------------------
+    tax_start_row = bs_checks_last_row + 4
+
+    tax_last_row, tax_last_col = _write_tax_reconciliation_table(
+        ws,
+        workpaper.tax_reconciliation,
+        "Final Tax Reconciliation",
+        tax_start_row,
+        1,
+    )
+
+    # ------------------------------------------------------------------
+    # 5. Support tables beside final tax reconciliation
+    # ------------------------------------------------------------------
     support_start_col = tax_last_col + 2
 
     current_row, _ = _write_simple_table(
         ws,
         workpaper.carry_forward_losses,
         "Carry Forward Losses",
-        1,
+        tax_start_row,
         support_start_col,
         input_table=True,
     )
@@ -561,8 +934,15 @@ def write_workbook(reports, workpaper) -> None:
             input_table=False,
         )
 
-    _format_sheet(ws, raw_last_col)
+    raw_last_col = max(
+        pl_last_col,
+        bs_last_col,
+        pl_summary_last_col,
+        tax_last_col,
+    )
 
+    _format_sheet(ws, raw_last_col)
+    
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.calculation.calcMode = "auto"

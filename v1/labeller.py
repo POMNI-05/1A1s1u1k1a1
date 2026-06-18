@@ -9,10 +9,21 @@ Design:
 """
 
 from __future__ import annotations
+from importlib import import_module
 
 import pandas as pd
 
-from itr_rules import match_financial_label
+from job_config import get_policy_year
+
+def _get_matcher():
+    year = str(get_policy_year("2026")).strip()
+
+    if year == "2025":
+        module_name = "itr_rules"
+    else:
+        module_name = f"itr_rules_{year}"
+
+    return module.match_financial_label
 
 LABEL_COLUMNS = [
     "ITR Ref",

@@ -13,6 +13,7 @@ Design:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -27,8 +28,9 @@ if str(FRONTEND_DIR) not in sys.path:
 import ui_text as T
 from job_runner import run_workpaper_job
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Revision question handler
+# Constants
 # ─────────────────────────────────────────────────────────────────────────────
 ATO_POLICY_YEARS = ["2026", "2025", "2024"]
 
@@ -43,6 +45,65 @@ OPTIONAL_TABLES = {
     "related_party_loans": "Related party loan table",
 }
 
+AI_PROVIDER_OPTIONS = ["None", "Gemini", "OpenAI", "Claude"]
+
+AI_MODEL_OPTIONS = {
+    "Gemini": [
+        "gemini-2.5-flash",
+        "gemini-2.5-pro",
+        "gemini-1.5-flash",
+    ],
+    "OpenAI": [
+        "gpt-4.1-mini",
+        "gpt-4.1",
+        "gpt-4o-mini",
+    ],
+    "Claude": [
+        "claude-3-5-sonnet-latest",
+        "claude-3-5-haiku-latest",
+    ],
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+def _apply_ai_environment(
+    *,
+    ai_provider: str,
+    ai_model: str,
+    api_key: str,
+    run_ai_face_check: bool,
+) -> None:
+    """Apply AI settings for the backend subprocess.
+
+    Current backend appears Gemini-ready. OpenAI/Claude flags are prepared for
+    future backend reviewer support.
+    """
+
+    # Reset flags first so previous Streamlit reruns do not leak settings.
+    os.environ["ENABLE_GEMINI_REVIEW"] = "false"
+    os.environ["ENABLE_OPENAI_REVIEW"] = "false"
+    os.environ["ENABLE_CLAUDE_REVIEW"] = "false"
+
+    if not run_ai_face_check or ai_provider == "None" or not api_key:
+        return
+
+    if ai_provider == "Gemini":
+        os.environ["GEMINI_API_KEY"] = api_key
+        os.environ["GEMINI_MODEL"] = ai_model
+        os.environ["ENABLE_GEMINI_REVIEW"] = "true"
+
+    elif ai_provider == "OpenAI":
+        os.environ["OPENAI_API_KEY"] = api_key
+        os.environ["OPENAI_MODEL"] = ai_model
+        os.environ["ENABLE_OPENAI_REVIEW"] = "true"
+
+    elif ai_provider == "Claude":
+        os.environ["ANTHROPIC_API_KEY"] = api_key
+        os.environ["CLAUDE_MODEL"] = ai_model
+        os.environ["ENABLE_CLAUDE_REVIEW"] = "true"
+
 
 def _handle_revision_question(question: str, result: dict) -> str:
     q = question.lower()
@@ -54,49 +115,49 @@ def _handle_revision_question(question: str, result: dict) -> str:
             "Accounting depreciation is not usually deductible as-is for tax. "
             "The workpaper adds it back for review/tax treatment, then tax depreciation "
             "should be claimed separately where applicable.\n\n"
-            "*Check the tax depreciation schedule before finalising.*"
+            "*Check the tax depreciation schedule before finalising.*",
         ),
         (
             ["cogs", "cost of goods", "cost of sales", "6a"],
             "**Why is Cost of Goods Sold / Cost of Sales under 6A?**\n\n"
             "Cost of sales normally maps to the company tax return cost-of-sales label. "
             "This covers direct costs connected to trading revenue.\n\n"
-            "*If the account is not a direct cost of sales, flag it for review.*"
+            "*If the account is not a direct cost of sales, flag it for review.*",
         ),
         (
             ["superannuation", "super", "7x", "prior year"],
             "**Why can superannuation need review?**\n\n"
             "Superannuation deductibility depends on payment timing. Accrued but unpaid super "
             "can need adjustment, while prior-year accrued super paid this year can be deductible.\n\n"
-            "*Check actual payment records and opening/closing accruals.*"
+            "*Check actual payment records and opening/closing accruals.*",
         ),
         (
             ["r&d", "research", "7d", "offset", "43.5"],
             "**Why is R&D expenditure added back at 7D?**\n\n"
             "Eligible R&D expenditure is generally removed from ordinary deductions and dealt "
             "with through the R&D Tax Incentive calculation. The add-back prevents double-counting.\n\n"
-            "*Confirm R&D eligibility and amounts with the R&D schedule/adviser.*"
+            "*Confirm R&D eligibility and amounts with the R&D schedule/adviser.*",
         ),
         (
             ["entertainment", "meal", "7w", "non-deductible"],
             "**Why is entertainment flagged for review?**\n\n"
             "Entertainment expenses can be non-deductible or subject to FBT depending on the facts. "
             "The exact nature of the expense should be reviewed before finalising treatment.\n\n"
-            "*Confirm whether it is entertainment, staff meal, travel meal, or client function.*"
+            "*Confirm whether it is entertainment, staff meal, travel meal, or client function.*",
         ),
         (
             ["6c", "consulting", "revenue", "income"],
             "**Why is consulting/service revenue mapped this way?**\n\n"
             "For many service companies, ordinary business income maps to the main income label. "
             "The exact label depends on the nature of income and withholding status.\n\n"
-            "*Check whether any income is subject to withholding or should be separately disclosed.*"
+            "*Check whether any income is subject to withholding or should be separately disclosed.*",
         ),
         (
             ["provision", "annual leave", "long service"],
             "**Why are leave provisions flagged for review?**\n\n"
             "Accounting leave provisions may not equal deductible tax amounts. Tax treatment often "
             "depends on whether leave has actually been paid or merely accrued.\n\n"
-            "*Confirm opening and closing provision balances from the Balance Sheet.*"
+            "*Confirm opening and closing provision balances from the Balance Sheet.*",
         ),
     ]
 
@@ -306,7 +367,7 @@ with left:
 
     company_profile = f"{company_type}. {company_profile_notes}".strip(". ")
 
-    # ── Document description ─────────────────────────────────────────────────
+    # ── Document / job description ───────────────────────────────────────────
     st.markdown(f'<div class="section-header">{T.SECTION_DESCRIBE}</div>', unsafe_allow_html=True)
 
     ato_policy_year = st.selectbox(
@@ -327,7 +388,8 @@ with left:
         with target_col:
             requested_tables[table_key] = st.checkbox(
                 table_label,
-                value=table_key in {
+                value=table_key
+                in {
                     "carry_forward_losses",
                     "rd_tax_incentive",
                     "depreciation",
@@ -345,15 +407,6 @@ with left:
         height=80,
     )
 
-    run_ai_face_check = st.checkbox(
-        "Run Gemini face-check after workbook generation",
-        value=True,
-        help=(
-            "Sends user inputs + a workbook summary to Gemini to identify obvious issues. "
-            "It should not replace accountant review."
-        ),
-    )
-
     document_description = st.text_area(
         T.DOC_DESCRIPTION_LABEL,
         placeholder=T.DOC_DESCRIPTION_PLACEHOLDER,
@@ -361,35 +414,12 @@ with left:
         height=90,
     )
 
-    # ── Generate ─────────────────────────────────────────────────────────────
-    st.markdown("")
-
-    generate_clicked = st.button(
-        T.GENERATE_BUTTON_LABEL,
-        type="primary",
-        use_container_width=True,
-    )
-
-    if generate_clicked:
-        if not uploaded_files:
-            st.error(T.ERROR_NO_FILES)
-        else:
-            with st.spinner(T.GENERATING_SPINNER_LABEL):
-                result = run_workpaper_job(
-                    extra_files=uploaded_files,
-                    company_profile=company_profile,
-                    document_description=document_description,
-                    client_name=client_name,
-                    ato_policy_year=ato_policy_year,
-                    requested_tables=requested_tables,
-                    reviewer_notes=reviewer_notes,
-                    run_ai_face_check=run_ai_face_check,
-                )
-            st.session_state.job_result = result
-            st.session_state.revision_response = None
-            st.rerun()
-
     # ── Admin ────────────────────────────────────────────────────────────────
+    ai_provider = "None"
+    ai_model = ""
+    api_key = ""
+    run_ai_face_check = False
+
     with st.expander(T.ADMIN_HEADER, expanded=False):
         st.markdown(
             f"""
@@ -403,8 +433,105 @@ with left:
             unsafe_allow_html=True,
         )
 
+        st.markdown('<div class="section-header">AI model setup</div>', unsafe_allow_html=True)
+
+        ai_provider = st.selectbox(
+            "AI provider",
+            options=AI_PROVIDER_OPTIONS,
+            index=0,
+            help=(
+                "Optional AI face-check after workbook generation. "
+                "Gemini is currently the safest supported backend path."
+            ),
+            key="admin_ai_provider",
+        )
+
+        if ai_provider != "None":
+            api_key = st.text_input(
+                f"{ai_provider} API key",
+                type="password",
+                placeholder=f"Paste {ai_provider} API key for this session",
+                help=(
+                    "The key is used for this Streamlit run only. "
+                    "For production, prefer Streamlit secrets or environment variables."
+                ),
+                key="admin_ai_api_key",
+            )
+
+            ai_model = st.selectbox(
+                "Model",
+                options=AI_MODEL_OPTIONS.get(ai_provider, []),
+                index=0,
+                help="Select the model used for the optional AI face-check.",
+                key="admin_ai_model",
+            )
+
+            if ai_provider != "Gemini":
+                st.info(
+                    f"{ai_provider} UI is prepared, but backend reviewer support may still need wiring. "
+                    "Gemini is the currently recommended option."
+                )
+
+        run_ai_face_check = st.checkbox(
+            "Run AI face-check after workbook generation",
+            value=False,
+            disabled=ai_provider == "None",
+            help=(
+                "Sends user inputs and workbook summary to the selected AI model. "
+                "This should not replace accountant review."
+            ),
+            key="admin_run_ai_face_check",
+        )
+
+        if run_ai_face_check and ai_provider != "None" and not api_key:
+            st.warning(f"Please enter a {ai_provider} API key, or turn off AI face-check.")
+
+        st.session_state["AI_PROVIDER"] = ai_provider
+        st.session_state["AI_MODEL"] = ai_model
+        st.session_state["AI_API_KEY_ENTERED"] = bool(api_key)
+
         if st.button(T.ADMIN_BUTTON):
             st.info(T.ADMIN_NOT_IMPL)
+
+    # ── Generate ─────────────────────────────────────────────────────────────
+    st.markdown("")
+
+    generate_clicked = st.button(
+        T.GENERATE_BUTTON_LABEL,
+        type="primary",
+        use_container_width=True,
+    )
+
+    if generate_clicked:
+        if not uploaded_files:
+            st.error(T.ERROR_NO_FILES)
+
+        elif run_ai_face_check and ai_provider != "None" and not api_key:
+            st.error(f"Please enter a {ai_provider} API key in Admin, or turn off AI face-check.")
+
+        else:
+            _apply_ai_environment(
+                ai_provider=ai_provider,
+                ai_model=ai_model,
+                api_key=api_key,
+                run_ai_face_check=run_ai_face_check,
+            )
+
+            with st.spinner(T.GENERATING_SPINNER_LABEL):
+                result = run_workpaper_job(
+                    extra_files=uploaded_files,
+                    company_profile=company_profile,
+                    document_description=document_description,
+                    client_name=client_name,
+                    ato_policy_year=ato_policy_year,
+                    requested_tables=requested_tables,
+                    reviewer_notes=reviewer_notes,
+                    run_ai_face_check=run_ai_face_check,
+                )
+
+            st.session_state.job_result = result
+            st.session_state.revision_response = None
+            st.rerun()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

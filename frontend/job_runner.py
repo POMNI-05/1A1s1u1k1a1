@@ -60,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-VALID_POLICY_YEARS = {"2024", "2025", "2026"}
+VALID_POLICY_YEARS = {"2025", "2026"}
 
 DEFAULT_REQUESTED_TABLES: dict[str, bool] = {
     "carry_forward_losses": False,

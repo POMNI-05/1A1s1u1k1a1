@@ -41,7 +41,6 @@ OPTIONAL_TABLES = {
     "superannuation": "Superannuation timing table",
     "gst_reconciliation": "GST / BAS reconciliation table",
     "related_party_loans": "Related party loan table",
-    "psi": "PSI / personal services income review table",
 }
 
 

@@ -1,18 +1,20 @@
 # v1/itr_rules_2026.py
 """ATO-aware account-name matching and ITR labelling logic for 2026.
 
-This module uses the 2025 itr_rules.py as the base and applies only
-2026-specific policy/risk overrides.
+This module uses the 2025 itr_rules.py as a structural base and applies
+2026-specific policy/risk overrides that have official support.
 
-Why import from 2025 base?
-- ATO Company tax return 2026 says no new labels were added or removed.
-- Therefore the printed label structure is substantially the 2025 structure.
-- 2026 differences are mainly treatment/review policy:
+Why import from the 2025 base?
+- The published Company tax return 2026 confirms the Item 6, Item 7 and Item 8
+  labels used here, but this remains preparation software rather than a lodgment
+  engine.
+- Confirm client facts and applicable schedules before lodgment. Current review
+  overlays include:
   - GIC/SIC non-deductibility from income years starting on/after 1 July 2025.
-  - $20,000 instant asset write-off extended to 2025-26.
-  - Proposed R&D gambling/tobacco exclusion, not law at publication.
-  - PCG 2025/5 PSI / alienation arrangement review.
-  - JMEI not extended beyond 30 June 2025.
+  - 2025-26 instant asset write-off eligibility confirmation.
+  - Gambling/tobacco R&D eligibility confirmation.
+  - PSI / alienation arrangement review under current ATO guidance.
+  - JMEI current-year eligibility confirmation.
 
 Keep full metadata, thresholds and form labels in itr_metadata.py /
 itr_year_overrides.py. This file should only change matching behaviour.
@@ -118,10 +120,10 @@ PL_RULES_2026_PRE: list[LabelRule] = [
     ),
 
     # ------------------------------------------------------------------
-    # 2. R&D gambling / tobacco proposed exclusion
+    # 2. R&D gambling / tobacco eligibility review
     # ------------------------------------------------------------------
-    # ATO says this was not law yet at publication, so do NOT auto-deny.
-    # We only force review and keep the normal R&D add-back direction.
+    # Do not infer eligibility or exclusion from an account name. We only force
+    # review and keep the normal accounting R&D add-back direction.
     R(
         [
             r"\br\s*and\s*d.*gambling\b",
@@ -151,9 +153,9 @@ PL_RULES_2026_PRE: list[LabelRule] = [
         "review_only",
         "high",
         (
-            "2026 review: proposed R&D tax incentive exclusion for some "
-            "gambling and tobacco activities was not law at ATO publication. "
-            "Do not auto-deny; review R&D schedule and eligibility."
+            "2026 review: confirm the enacted R&D rules and registered activity "
+            "eligibility for gambling or tobacco-related work. Do not auto-deny "
+            "or auto-claim from the account name; review the R&D schedule."
         ),
         "Mapped gambling/tobacco R&D account to 2026 high-risk R&D review.",
         "7D",
@@ -189,9 +191,9 @@ PL_RULES_2026_PRE: list[LabelRule] = [
         "review_only",
         "high",
         (
-            "2026 review: account suggests R&D connected with gambling, "
-            "casino, betting, tobacco, vape or nicotine. Proposed exclusion "
-            "was not law at publication, so accountant review is required."
+            "2026 review: account suggests R&D connected with gambling, casino, "
+            "betting, tobacco, vape or nicotine. Confirm current enacted rules, "
+            "registration and expenditure eligibility before any claim."
         ),
         "Mapped R&D-sensitive industry account to 2026 high-risk R&D review.",
         "7D",
@@ -201,7 +203,7 @@ PL_RULES_2026_PRE: list[LabelRule] = [
     ),
 
     # ------------------------------------------------------------------
-    # 3. PSI / PCG 2025/5 / associated-person review
+    # 3. PSI / associated-person review
     # ------------------------------------------------------------------
     R(
         [
@@ -231,10 +233,11 @@ PL_RULES_2026_PRE: list[LabelRule] = [
         "review_only",
         "high",
         (
-            "2026 review: PCG 2025/5 highlights PSI alienation arrangements, "
-            "retention of profits and income splitting risks. Review Item 8Q, "
-            "Item 14 PSI, Division 7A and Part IVA risk. Do not auto-populate "
-            "8Q from account name alone."
+            "2026 review: apply current ATO PSI/PSB guidance (including "
+            "TR 2022/3) and review alienation, retention of profits and income "
+            "splitting risks. Review Item 8Q, Item 14 PSI, Division 7A and "
+            "Part IVA where relevant. Do not auto-populate 8Q from an account "
+            "name alone."
         ),
         "Mapped PSI/associated-person indicator to 2026 high-risk review.",
         support_key="8Q_payments_to_associated_persons",
@@ -253,13 +256,13 @@ PL_RULES_2026_PRE: list[LabelRule] = [
             r"\bmineral exploration credits?\b",
         ],
         "Review",
-        "Junior Mineral Exploration Incentive - unavailable from 1 July 2025",
+        "Junior Mineral Exploration Incentive - current-year eligibility review",
         "review_only",
         "high",
         (
-            "2026 rule: Junior Mineral Exploration Incentive was not extended "
-            "beyond 30 June 2025. From 1 July 2025 exploration credits cannot "
-            "be received or claimed."
+            "2026 review: confirm whether the exploration credit relates to a "
+            "valid entitlement and income year under current enacted rules and "
+            "ATO guidance. Do not auto-claim from the account name."
         ),
         "Mapped JMEI/exploration credit account to 2026 manual review.",
     ),
@@ -315,11 +318,10 @@ PL_RULES_2026_PRE: list[LabelRule] = [
         "review_only",
         "high",
         (
-            "2026 rule: $20,000 instant asset write-off applies for eligible "
-            "small business entities for assets first used or installed ready "
-            "for use between 1 July 2025 and 30 June 2026. Check Item 10A/10B "
-            "and ensure Item 6X uses tax depreciation where SBE simplified "
-            "depreciation applies."
+            "2026: the enacted instant asset write-off threshold is $20,000 for "
+            "eligible small business entities. Confirm asset and entity eligibility, "
+            "taxable-use timing and cost, then check Item 10A/10B and whether "
+            "Item 6X should use tax rather than book depreciation."
         ),
         "Mapped instant asset write-off / simplified depreciation account to 2026 6X and Item 10 review.",
         "",
@@ -456,10 +458,10 @@ def _post_adjust_2026_mapping(
         result = _force_review(
             mapping,
             (
-                "2026: review R&D schedule carefully. R&D gambling/tobacco "
-                "exclusion was proposed but not law at publication; if relevant, "
-                "do not auto-deny without accountant review. Check Item 7D, 7B, "
-                "7X and Item 21."
+                "2026: review the R&D schedule carefully and confirm current "
+                "enacted rules, registration and expenditure eligibility. For "
+                "gambling/tobacco-related activity, do not auto-deny or auto-claim. "
+                "Check Item 7D, 7B, 7X and Item 21."
             ),
             "2026 post-adjustment: R&D gets additional 2026 review note.",
             confidence="high",
@@ -477,16 +479,17 @@ def _post_adjust_2026_mapping(
 
     # ------------------------------------------------------------------
     # Category: depreciation / assets
-    # Keep 2025 label, add 2026 threshold period.
+    # Keep the label and require review of the conditions around the enacted threshold.
     # ------------------------------------------------------------------
     if mapping.get("ITR Ref") == "Exp - 6X":
         return _force_review(
             mapping,
             (
-                "2026: $20,000 instant asset write-off is available for eligible "
-                "SBE assets first used or installed ready for use between "
-                "1 July 2025 and 30 June 2026. Check Item 10A/10B and whether "
-                "6X should use tax values rather than book depreciation."
+                "2026: the enacted instant asset write-off threshold is $20,000 "
+                "for eligible small business entities. Confirm asset and entity "
+                "eligibility, taxable-use timing and cost. "
+                "Check Item 10A/10B and whether 6X should use tax rather than "
+                "book depreciation."
             ),
             "2026 post-adjustment: depreciation gets 2026 instant asset write-off note.",
             confidence="medium",
@@ -494,7 +497,7 @@ def _post_adjust_2026_mapping(
 
     # ------------------------------------------------------------------
     # Category: PSI / salary / associated persons
-    # Salary/wages remain 6S, but 2026 should flag PCG 2025/5 where relevant.
+    # Salary/wages remain 6S, but associated-person/PSI indicators need review.
     # ------------------------------------------------------------------
     if _has_any(
         text,
@@ -514,9 +517,9 @@ def _post_adjust_2026_mapping(
         result = _force_review(
             mapping,
             (
-                "2026: review PCG 2025/5 PSI / alienation arrangement risk, "
-                "Item 8Q payments to associated persons, Item 14 PSI and "
-                "Division 7A where relevant."
+                "2026: apply current ATO PSI/PSB guidance, including TR 2022/3, "
+                "and review alienation/Part IVA risk, Item 8Q payments to "
+                "associated persons, Item 14 PSI and Division 7A where relevant."
             ),
             "2026 post-adjustment: associated-person/PSI indicator detected.",
             confidence="high",

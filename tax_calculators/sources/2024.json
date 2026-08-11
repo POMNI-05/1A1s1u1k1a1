@@ -1,0 +1,42 @@
+{
+  "schema_version": "1.0",
+  "income_year": "2024",
+  "period": "2023-07-01/2024-06-30",
+  "verified_on": "2026-08-11",
+  "company_tax": {
+    "status": "enacted",
+    "base_rate_entity_rate": "0.25",
+    "general_rate": "0.30",
+    "base_rate_entity_turnover_threshold": "50000000",
+    "passive_income_max_ratio": "0.80",
+    "source_url": "https://www.ato.gov.au/tax-rates-and-codes/company-tax-rates"
+  },
+  "rd_tax_incentive": {
+    "status": "enacted",
+    "refundable_turnover_threshold": "20000000",
+    "refundable_premium": "0.185",
+    "non_refundable_intensity_threshold": "0.02",
+    "non_refundable_lower_premium": "0.085",
+    "non_refundable_upper_premium": "0.165",
+    "notional_deduction_cap": "150000000",
+    "source_url": "https://www.ato.gov.au/forms-and-instructions/research-and-development-tax-incentive-schedule-2024-instructions"
+  },
+  "depreciation": {
+    "status": "enacted",
+    "prime_cost_factor": "1.00",
+    "diminishing_value_factor": "2.00",
+    "day_denominator": "365",
+    "source_url": "https://www.ato.gov.au/forms-and-instructions/guide-to-depreciating-assets-2024"
+  },
+  "division7a": {
+    "status": "enacted",
+    "benchmark_interest_rate": "0.0827",
+    "source_url": "https://www.ato.gov.au/tax-rates-and-codes/division-7a-benchmark-interest-rate"
+  },
+  "instant_asset_writeoff": {
+    "status": "enacted",
+    "threshold": "20000",
+    "aggregated_turnover_threshold": "10000000",
+    "source_url": "https://www.ato.gov.au/businesses-and-organisations/income-deductions-and-concessions/depreciation-and-capital-expenses-and-allowances/simpler-depreciation-for-small-business/instant-asset-write-off"
+  }
+}

@@ -10,17 +10,40 @@ from typing import Any
 
 import pandas as pd
 
-from cleaner import CleanedReports, load_clean_report_bundle, clean_amount
-from config import (
-    AUTO_POST_TAX_DEPRECIATION_TO_7F,
-    CARRY_FORWARD_LOSSES_TEMPLATE,
-    RD_BREAKDOWN_TEMPLATE,
-    RD_OFFSET_AMOUNT,
-    TAX_ADJUSTMENTS,
-    TAX_RATE,
-)
-from itr_metadata import WORKSHEET_2, validate_adjustment_label, get_item7_direction
-from labeller import label_report, extract_review_items
+try:
+    from .cleaner import CleanedReports, load_clean_report_bundle, clean_amount
+    from .config import (
+        AUTO_POST_TAX_DEPRECIATION_TO_7F,
+        CARRY_FORWARD_LOSSES_TEMPLATE,
+        COMPANY_TAX_RATE_CATEGORY,
+        RD_BREAKDOWN_TEMPLATE,
+        RD_OFFSET_AMOUNT,
+        SELECTED_ATO_POLICY,
+        SELECTED_INCOME_YEAR,
+        TAX_ADJUSTMENTS,
+        TAX_RATE,
+    )
+    from .itr_metadata import WORKSHEET_2, validate_adjustment_label, get_item7_direction
+    from .job_config import table_requested
+    from .labeller import label_report, extract_review_items
+except ImportError:  # Direct-script compatibility.
+    from cleaner import CleanedReports, load_clean_report_bundle, clean_amount
+    from config import (
+        AUTO_POST_TAX_DEPRECIATION_TO_7F,
+        CARRY_FORWARD_LOSSES_TEMPLATE,
+        COMPANY_TAX_RATE_CATEGORY,
+        RD_BREAKDOWN_TEMPLATE,
+        RD_OFFSET_AMOUNT,
+        SELECTED_ATO_POLICY,
+        SELECTED_INCOME_YEAR,
+        TAX_ADJUSTMENTS,
+        TAX_RATE,
+    )
+    from itr_metadata import WORKSHEET_2, validate_adjustment_label, get_item7_direction
+    from job_config import table_requested
+    from labeller import label_report, extract_review_items
+
+from tax_calculators.company_tax import calculate_company_tax
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +60,40 @@ class Workpaper:
     rd_breakdown: pd.DataFrame
     bs_checks: pd.DataFrame
     review_items: pd.DataFrame
+    proposed_adjustments: pd.DataFrame
+    support_tables: dict[str, pd.DataFrame]
+
+
+SUPPORT_TABLE_TEMPLATES: dict[str, tuple[str, list[dict[str, Any]]]] = {
+    "div7a": (
+        "Division 7A / Shareholder Loans",
+        [{"Description": "Closing shareholder/director loan balance", "Amount": None, "Review note": "Confirm debit/credit balance and Division 7A treatment."}],
+    ),
+    "fbt_entertainment": (
+        "FBT / Entertainment Review",
+        [{"Description": "Entertainment and meal expenses", "Amount": None, "Review note": "Confirm deductibility, GST and FBT treatment."}],
+    ),
+    "depreciation": (
+        "Tax Depreciation / Capital Allowances",
+        [{"Description": "Tax decline in value deduction", "Amount": None, "Review note": "Agree to reviewed tax depreciation schedule before posting at 7F."}],
+    ),
+    "superannuation": (
+        "Superannuation Timing",
+        [{"Description": "Accrued or unpaid superannuation", "Amount": None, "Review note": "Confirm payment date and deductibility."}],
+    ),
+    "gst_reconciliation": (
+        "GST / BAS Reconciliation",
+        [{"Description": "GST control account difference", "Amount": None, "Review note": "Reconcile ledger to lodged BAS."}],
+    ),
+    "related_party_loans": (
+        "Related-party Loans",
+        [{"Description": "Related-party loan balance", "Amount": None, "Review note": "Confirm counterparty, terms, interest and cross-border implications."}],
+    ),
+    "psi": (
+        "Personal Services Income Review",
+        [{"Description": "PSI/PSE review", "Amount": None, "Review note": "Complete PSI tests and attribution review where applicable."}],
+    ),
+}
 
 def _get_account_col(df: pd.DataFrame) -> str:
     for col in df.columns:
@@ -380,7 +437,8 @@ def _manual_adjustment_rows(periods: list[str]) -> tuple[list[dict], list[dict],
             has_amount = False
 
             for period in periods:
-                amount = abs(_get_adjustment_amount(adj, period))
+                # Preserve deliberate reversals/credits entered by the reviewer.
+                amount = _get_adjustment_amount(adj, period)
                 row[period] = amount
 
                 if abs(amount) > 0.005:
@@ -426,6 +484,12 @@ def _auto_reconciliation_rows_from_labelled_pl(
         if not recon_ref:
             continue
 
+        auto_post = str(row.get("Auto Post", "") or "").strip().lower()
+        if auto_post not in {"yes", "true", "1", "approved"}:
+            # Rule matches are proposals. They must not change taxable income
+            # unless an accountant has explicitly approved automatic posting.
+            continue
+
         validate_adjustment_label(recon_ref, str(row.get(account_col, "")))
         direction = get_item7_direction(recon_ref)
 
@@ -450,7 +514,7 @@ def _auto_reconciliation_rows_from_labelled_pl(
         has_amount = False
 
         for period in periods:
-            amount = abs(clean_amount(row.get(period, 0.0)))
+            amount = clean_amount(row.get(period, 0.0))
             output_row[period] = amount
 
             if abs(amount) > 0.005:
@@ -470,6 +534,60 @@ def _auto_reconciliation_rows_from_labelled_pl(
             subtract_rows.append(output_row)
 
     return add_rows, subtract_rows, total_add_backs, total_subtractions
+
+
+def _build_proposed_adjustments(
+    labelled_pl: pd.DataFrame,
+    periods: list[str],
+) -> pd.DataFrame:
+    columns = [
+        "Account",
+        "ITR Ref",
+        "Direction",
+        *periods,
+        "Treatment",
+        "Confidence",
+        "Approval Status",
+        "Review Note",
+    ]
+
+    if labelled_pl is None or labelled_pl.empty:
+        return pd.DataFrame(columns=columns)
+
+    account_col = _get_account_col(labelled_pl)
+    proposals: list[dict[str, Any]] = []
+
+    for _, row in labelled_pl.iterrows():
+        if str(row.get("Row Type", "") or "").strip().lower() != "account":
+            continue
+
+        recon_ref = str(
+            row.get("Recon Display Ref", "")
+            or row.get("Recon ITR Ref", "")
+            or ""
+        ).strip()
+        if not recon_ref:
+            continue
+
+        auto_post = str(row.get("Auto Post", "") or "").strip().lower()
+        proposal: dict[str, Any] = {
+            "Account": str(row.get(account_col, "") or "").strip(),
+            "ITR Ref": recon_ref,
+            "Direction": str(row.get("Recon Direction", "") or "").strip(),
+            "Treatment": str(row.get("Treatment", "") or "").strip(),
+            "Confidence": str(row.get("Confidence", "") or "").strip(),
+            "Approval Status": (
+                "Approved for posting"
+                if auto_post in {"yes", "true", "1", "approved"}
+                else "Review required - not posted"
+            ),
+            "Review Note": str(row.get("Review Note", "") or "").strip(),
+        }
+        for period in periods:
+            proposal[period] = clean_amount(row.get(period, 0.0))
+        proposals.append(proposal)
+
+    return pd.DataFrame(proposals, columns=columns)
 
 
 def _tax_depreciation_reconciliation_rows(
@@ -504,7 +622,7 @@ def _tax_depreciation_reconciliation_rows(
     }
 
     for idx, period in enumerate(periods):
-        amount = abs(tax_depreciation_total) if idx == 0 else 0.0
+        amount = float(tax_depreciation_total) if idx == 0 else 0.0
         row[period] = amount
         total_subtractions[period] += amount
 
@@ -526,7 +644,7 @@ def _build_tax_reconciliation(
     base_row = {
         "Line Type": "result",
         "Description": "Accounting Profit Before Tax",
-        "ITR Ref": "7T",
+        "ITR Ref": "6T",
         "Review note": "",
     }
 
@@ -631,7 +749,7 @@ def _build_tax_reconciliation(
     taxable_row = {
         "Line Type": "result",
         "Description": "Taxable Income",
-        "ITR Ref": "",
+        "ITR Ref": "7T",
         "Review note": "",
     }
 
@@ -640,17 +758,34 @@ def _build_tax_reconciliation(
 
     rows.append(taxable_row)
 
+    tax_rate_label = f"{TAX_RATE:.0%}" if TAX_RATE is not None else "review required"
     tax_row = {
         "Line Type": "detail",
-        "Description": f"Tax Payable at {TAX_RATE:.0%}",
+        "Description": f"Indicative tax on taxable income - rate {tax_rate_label}",
         "ITR Ref": "",
-        "Review note": "",
+        "Review note": (
+            ""
+            if TAX_RATE is not None
+            else "Select and confirm the company tax rate before relying on tax payable."
+        ),
     }
 
     tax_payable_by_period = {}
 
     for period in periods:
-        tax_payable = max(taxable_income[period], 0.0) * TAX_RATE
+        taxable_amount = max(taxable_income[period], 0.0)
+        if TAX_RATE is None:
+            tax_payable = None
+        else:
+            tax_result = calculate_company_tax(
+                SELECTED_INCOME_YEAR,
+                taxable_income=str(taxable_amount),
+                rate_category=COMPANY_TAX_RATE_CATEGORY,
+                base_rate_eligibility_confirmed=(
+                    COMPANY_TAX_RATE_CATEGORY == "base_rate_entity"
+                ),
+            )
+            tax_payable = float(tax_result.gross_tax)
         tax_payable_by_period[period] = tax_payable
         tax_row[period] = tax_payable
 
@@ -665,15 +800,21 @@ def _build_tax_reconciliation(
 
     final_tax_row = {
         "Line Type": "result",
-        "Description": "Tax Payable / (Refund due)",
+        "Description": "Indicative tax after entered R&D offset",
         "ITR Ref": "",
-        "Review note": "",
+        "Review note": (
+            "Does not include all tax offsets, credits, instalments or "
+            "special-rate calculations."
+        ),
     }
 
     for period in periods:
         tax_payable = tax_payable_by_period[period]
 
-        if RD_OFFSET_AMOUNT is None:
+        if tax_payable is None:
+            rd_offset_row[period] = RD_OFFSET_AMOUNT
+            final_tax_row[period] = None
+        elif RD_OFFSET_AMOUNT is None:
             rd_offset_row[period] = None
             final_tax_row[period] = tax_payable
         else:
@@ -694,6 +835,24 @@ def _build_tax_reconciliation(
         method_row[period] = net_profit_methods.get(period, "")
 
     rows.append(method_row)
+
+    source_registry = SELECTED_ATO_POLICY["source_registry"]
+    policy_row = _blank_periods(
+        {
+            "Line Type": "note",
+            "Description": (
+                f"ATO rule pack {SELECTED_INCOME_YEAR} "
+                f"(verified {source_registry['verified_on']})"
+            ),
+            "ITR Ref": "",
+            "Review note": (
+                "Rates and thresholds loaded from the versioned rule registry; "
+                "review client eligibility and judgment-dependent treatments."
+            ),
+        },
+        periods,
+    )
+    rows.append(policy_row)
 
     ordered_cols = ["Line Type", "Description"] + periods + ["ITR Ref", "Review note"]
 
@@ -842,8 +1001,25 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
 
     bs_checks = _build_bs_checks(clean_bs_df)
 
-    carry_forward_losses = pd.DataFrame(CARRY_FORWARD_LOSSES_TEMPLATE)
-    rd_breakdown = pd.DataFrame(RD_BREAKDOWN_TEMPLATE)
+    carry_forward_losses = (
+        pd.DataFrame(CARRY_FORWARD_LOSSES_TEMPLATE)
+        if table_requested("carry_forward_losses")
+        else pd.DataFrame()
+    )
+    rd_breakdown = (
+        pd.DataFrame(RD_BREAKDOWN_TEMPLATE)
+        if table_requested("rd_tax_incentive")
+        else pd.DataFrame()
+    )
+
+    support_tables = {
+        title: pd.DataFrame(rows)
+        for key, (title, rows) in SUPPORT_TABLE_TEMPLATES.items()
+        if table_requested(key)
+    }
+
+    periods = list(_extract_net_profit_by_period(clean_pl_df)[0].keys())
+    proposed_adjustments = _build_proposed_adjustments(labelled_pl, periods)
 
     review_blocks = [
         extract_review_items(labelled_pl, "P&L"),
@@ -878,4 +1054,6 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
         rd_breakdown=rd_breakdown,
         bs_checks=bs_checks,
         review_items=review_items,
+        proposed_adjustments=proposed_adjustments,
+        support_tables=support_tables,
     )

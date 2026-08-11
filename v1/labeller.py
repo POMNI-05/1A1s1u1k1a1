@@ -15,8 +15,12 @@ from importlib import import_module
 
 import pandas as pd
 
-from job_config import get_policy_year
-from label_overrides import apply_label_override, load_overrides
+try:
+    from .job_config import get_policy_year
+    from .label_overrides import apply_label_override, load_overrides
+except ImportError:  # Direct-script compatibility.
+    from job_config import get_policy_year
+    from label_overrides import apply_label_override, load_overrides
 
 
 LABEL_COLUMNS = [
@@ -36,6 +40,7 @@ LABEL_COLUMNS = [
     "Override Applied",
     "Override Name",
     "Override Reason",
+    "Auto Post",
 ]
 
 
@@ -48,10 +53,12 @@ def _get_matcher():
     """
     year = str(get_policy_year("2026")).strip()
 
+    package = __package__
+
     if year == "2025":
-        module_name = "itr_rules"
+        module_name = f"{package}.itr_rules" if package else "itr_rules"
     else:
-        module_name = f"itr_rules_{year}"
+        module_name = f"{package}.itr_rules_{year}" if package else f"itr_rules_{year}"
 
     try:
         rules_module = import_module(module_name)
@@ -153,7 +160,7 @@ def _should_label_row(row_type: str, report_type: str, account_name: str) -> boo
 
 def _net_profit_mapping() -> dict:
     return {
-        "ITR Ref": "7T",
+        "ITR Ref": "6T",
         "ITR Label": "Accounting profit/loss before tax",
         "Treatment": "base_for_tax_reconciliation",
         "Confidence": "high",

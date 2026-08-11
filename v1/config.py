@@ -16,18 +16,27 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from itr_metadata import TAX_RATES, RD_OFFSET_RATES, SMALL_BUSINESS_THRESHOLDS
+from tax_calculators.company_tax import assess_base_rate_entity
+from tax_calculators.validation import CalculatorError, to_decimal
+
+try:
+    from .ato_policy import get_policy_for_year
+    from .job_config import load_job_config
+except ImportError:  # Direct-script compatibility.
+    from ato_policy import get_policy_for_year
+    from job_config import load_job_config
 
 # ---------------------------------------------------------------------------
 # 1. Base paths
 # ---------------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+JOB_WORK_DIR = Path(os.getenv("TAX_JOB_WORK_DIR", str(BASE_DIR)))
+DATA_DIR = Path(os.getenv("TAX_DATA_DIR", str(JOB_WORK_DIR / "data")))
 INPUT_DIR = DATA_DIR
 PROCESSED_DIR = DATA_DIR / "processed"
-OUTPUT_DIR = BASE_DIR / "output"
-LOG_DIR = BASE_DIR / "logs"
+OUTPUT_DIR = Path(os.getenv("TAX_OUTPUT_DIR", str(JOB_WORK_DIR / "output")))
+LOG_DIR = Path(os.getenv("TAX_LOG_DIR", str(JOB_WORK_DIR / "logs")))
 
 # Backward-compatible separate-file names.
 PL_RAW_PATH = DATA_DIR / "profit_and_loss_raw.xlsx"
@@ -52,7 +61,9 @@ TAX_DEPRECIATION_SHEET_NAME = os.getenv("TAX_DEPRECIATION_SHEET_NAME", "")
 # 2. Output settings
 # ---------------------------------------------------------------------------
 
-OUTPUT_PATH = OUTPUT_DIR / "5_ZHI_output.xlsx"
+OUTPUT_PATH = Path(
+    os.getenv("TAX_OUTPUT_PATH", str(OUTPUT_DIR / "tax_workpaper.xlsx"))
+)
 
 SHEET_PL_RAW = "Profit and Loss"
 SHEET_BS_RAW = "Balance Sheet"
@@ -71,7 +82,10 @@ REPORT_TYPE_UNKNOWN = "unknown"
 # 4. Job options / frontend checkbox defaults
 # ---------------------------------------------------------------------------
 
-SELECTED_INCOME_YEAR = os.getenv("SELECTED_INCOME_YEAR", "2026")
+SELECTED_INCOME_YEAR = os.getenv(
+    "SELECTED_INCOME_YEAR",
+    os.getenv("ATO_POLICY_YEAR", "2026"),
+)
 
 INCLUDE_RD_TABLE = os.getenv("INCLUDE_RD_TABLE", "true").lower() == "true"
 INCLUDE_CARRY_LOSS_TABLE = os.getenv("INCLUDE_CARRY_LOSS_TABLE", "true").lower() == "true"
@@ -96,15 +110,72 @@ GEMINI_REVIEW_CONFIDENCE_THRESHOLD = os.getenv(
 # 5. Tax settings
 # ---------------------------------------------------------------------------
 
-BASE_RATE_ENTITY = os.getenv("BASE_RATE_ENTITY", "true").lower() == "true"
-TAX_RATE = TAX_RATES["base_rate_entity"] if BASE_RATE_ENTITY else TAX_RATES["general"]
+COMPANY_TAX_RATE_CATEGORY = os.getenv(
+    "COMPANY_TAX_RATE_CATEGORY",
+    "review_required",
+).strip().lower()
+
+_JOB_CONFIG = load_job_config()
+BASE_RATE_ENTITY_ASSESSMENT = _JOB_CONFIG.get("base_rate_entity_assessment") or {}
+
+
+def _base_rate_assessment_is_valid() -> bool:
+    if BASE_RATE_ENTITY_ASSESSMENT.get("reviewer_confirmed") is not True:
+        return False
+    try:
+        if to_decimal(
+            BASE_RATE_ENTITY_ASSESSMENT.get("total_assessable_income"),
+            "total_assessable_income",
+        ) <= 0:
+            return False
+        assessment = assess_base_rate_entity(
+            SELECTED_INCOME_YEAR,
+            aggregated_turnover=BASE_RATE_ENTITY_ASSESSMENT.get(
+                "aggregated_turnover"
+            ),
+            total_assessable_income=BASE_RATE_ENTITY_ASSESSMENT.get(
+                "total_assessable_income"
+            ),
+            base_rate_entity_passive_income=BASE_RATE_ENTITY_ASSESSMENT.get(
+                "base_rate_entity_passive_income"
+            ),
+        )
+    except (CalculatorError, TypeError, ValueError):
+        return False
+    return assessment.eligible_on_supplied_figures
+
+
+if COMPANY_TAX_RATE_CATEGORY == "base_rate_entity" and not _base_rate_assessment_is_valid():
+    # A bare environment variable or stale UI choice is not sufficient evidence.
+    COMPANY_TAX_RATE_CATEGORY = "review_required"
+
+SELECTED_ATO_POLICY = get_policy_for_year(SELECTED_INCOME_YEAR)
+SELECTED_TAX_RATES = SELECTED_ATO_POLICY["tax_rates"]
+
+if COMPANY_TAX_RATE_CATEGORY == "base_rate_entity":
+    TAX_RATE = SELECTED_TAX_RATES["base_rate_entity"]
+elif COMPANY_TAX_RATE_CATEGORY == "general":
+    TAX_RATE = SELECTED_TAX_RATES["general"]
+else:
+    # A rate must never be guessed from the client's generic company profile.
+    TAX_RATE = None
 
 SMALL_BUSINESS_ENTITY = os.getenv("SMALL_BUSINESS_ENTITY", "false").lower() == "true"
-INSTANT_ASSET_WRITEOFF_LIMIT = SMALL_BUSINESS_THRESHOLDS["instant_asset_writeoff"]
+INSTANT_ASSET_WRITEOFF_LIMIT = SELECTED_ATO_POLICY[
+    "small_business_thresholds"
+]["instant_asset_writeoff"]
 
 RD_ELIGIBLE = os.getenv("RD_ELIGIBLE", "false").lower() == "true"
 RD_REFUNDABLE = os.getenv("RD_REFUNDABLE", "true").lower() == "true"
-RD_OFFSET_RATE = RD_OFFSET_RATES["refundable"] if RD_REFUNDABLE else RD_OFFSET_RATES["non_refundable"]
+RD_PREMIUMS = SELECTED_ATO_POLICY["rd_offset_rates"]
+# A refundable R&D rate is the selected company rate plus 18.5 percentage
+# points. A non-refundable claim is intensity-tiered, so no single safe rate
+# exists without additional inputs.
+RD_OFFSET_RATE = (
+    TAX_RATE + RD_PREMIUMS["refundable_premium"]
+    if RD_ELIGIBLE and RD_REFUNDABLE and TAX_RATE is not None
+    else None
+)
 
 # ---------------------------------------------------------------------------
 # 6. Reviewed tax reconciliation inputs

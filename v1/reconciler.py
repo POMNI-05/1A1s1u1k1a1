@@ -2,8 +2,12 @@
 """Backward-compatible facade for older scripts."""
 from __future__ import annotations
 
-from workpaper_builder import build_workpaper
-from write_workbook import write_workbook
+try:
+    from .workpaper_builder import build_workpaper
+    from .write_workbook import write_workbook
+except ImportError:  # Direct-script compatibility.
+    from workpaper_builder import build_workpaper
+    from write_workbook import write_workbook
 
 
 def build_reconciliation(pl_df=None, bs_df=None):

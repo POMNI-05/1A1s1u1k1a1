@@ -16,26 +16,44 @@ Do NOT put Xero account-name matching logic here.
 
 from __future__ import annotations
 
+from tax_calculators.registry import get_year_source
+
 
 # ---------------------------------------------------------------------------
 # A. Tax rates and thresholds
 # ---------------------------------------------------------------------------
 
+_DEFAULT_RULE_SOURCE = get_year_source("2026")
+_COMPANY_RULES = _DEFAULT_RULE_SOURCE["company_tax"]
+_INSTANT_ASSET_RULES = _DEFAULT_RULE_SOURCE["instant_asset_writeoff"]
+_RD_RULES = _DEFAULT_RULE_SOURCE["rd_tax_incentive"]
+
+# Backward-compatible views only. New calculation code should request a year
+# from tax_calculators.registry instead of importing these default-year values.
 TAX_RATES = {
-    "base_rate_entity": 0.25,
-    "general": 0.30,
+    "base_rate_entity": float(_COMPANY_RULES["base_rate_entity_rate"]),
+    "general": float(_COMPANY_RULES["general_rate"]),
 }
 
 RD_OFFSET_RATES = {
-    "refundable": 0.435,
-    "non_refundable": 0.385,
+    "refundable_premium": float(_RD_RULES["refundable_premium"]),
+    "non_refundable_lower_premium": float(
+        _RD_RULES["non_refundable_lower_premium"]
+    ),
+    "non_refundable_upper_premium": float(
+        _RD_RULES["non_refundable_upper_premium"]
+    ),
 }
 
 SMALL_BUSINESS_THRESHOLDS = {
-    "aggregated_turnover": 10_000_000,
-    "base_rate_entity_turnover": 50_000_000,
-    "rd_refundable_turnover": 20_000_000,
-    "instant_asset_writeoff": 20_000,
+    "aggregated_turnover": float(
+        _INSTANT_ASSET_RULES["aggregated_turnover_threshold"]
+    ),
+    "base_rate_entity_turnover": float(
+        _COMPANY_RULES["base_rate_entity_turnover_threshold"]
+    ),
+    "rd_refundable_turnover": float(_RD_RULES["refundable_turnover_threshold"]),
+    "instant_asset_writeoff": float(_INSTANT_ASSET_RULES["threshold"]),
 }
 
 
@@ -50,8 +68,8 @@ SMALL_BUSINESS_THRESHOLDS = {
 
 ITEM_7_LABELS = {
     "7T": {
-        "name": "Total profit or loss",
-        "direction": "base",
+        "name": "Taxable/net income or loss",
+        "direction": "result",
         "active": True,
         "auto_supported": True,
     },
@@ -70,7 +88,7 @@ ITEM_7_LABELS = {
         "auto_supported": True,
     },
     "7C": {
-        "name": "Section 46FA deductions",
+        "name": "Australian franking credits from a New Zealand company",
         "direction": "add",
         "active": True,
         "auto_supported": False,
@@ -82,13 +100,13 @@ ITEM_7_LABELS = {
         "auto_supported": True,
     },
     "7E": {
-        "name": "Australian franking credits from a New Zealand franking company",
+        "name": "TOFA income from financial arrangements not included in item 6",
         "direction": "add",
         "active": True,
         "auto_supported": False,
     },
     "7U": {
-        "name": "Add back other items",
+        "name": "Non-deductible exempt income expenditure",
         "direction": "add",
         "active": True,
         "auto_supported": False,
@@ -101,7 +119,7 @@ ITEM_7_LABELS = {
     },
     "7Y": {
         "name": "Build-to-rent capital works deduction at 4%",
-        "direction": "add",
+        "direction": "information_only",
         "active": True,
         "auto_supported": False,
         "review_required": True,
@@ -179,38 +197,56 @@ ITEM_7_LABELS = {
     # Keep as active template rows, but do not auto-populate until accountant-reviewed.
     "7C46": {
         "name": "Section 46 deductions / special disclosure item",
-        "direction": "add",
+        "display_ref": "7C",
+        "direction": "subtract",
         "active": True,
         "auto_supported": False,
     },
     "7U-F": {
-        "name": "Special Item 7U disclosure field",
+        "name": "Forestry managed investment scheme deduction",
+        "display_ref": "7U",
         "direction": "subtract",
         "active": True,
         "auto_supported": False,
     },
     "7E-i": {
-        "name": "Special Item 7E information field",
-        "direction": "add",
+        "name": "Immediate deduction for capital expenditure",
+        "display_ref": "7E",
+        "direction": "subtract",
         "active": True,
         "auto_supported": False,
     },
     "7W-T": {
-        "name": "Special Item 7W total / information field",
-        "direction": "add",
+        "name": "TOFA deductions from financial arrangements not included in item 6",
+        "display_ref": "7W",
+        "direction": "subtract",
         "active": True,
         "auto_supported": False,
     },
 
-    # Removed labels
+    # Printed label J is reused within Item 7. This key is the continuing
+    # add-back label for franking credits, not the temporary training boost.
     "7J": {
+        "name": "Franking credits",
+        "direction": "add",
+        "active": True,
+        "auto_supported": False,
+        "review_required": True,
+    },
+
+    # Removed temporary incentive labels. Use a distinct internal key for the
+    # training boost because its printed J collides with franking credits.
+    "7J_TRAINING": {
         "name": "Small business skills and training boost",
+        "display_ref": "7J",
+        "direction": "subtract",
         "active": False,
         "removed_in": "2025",
         "auto_supported": False,
     },
     "7K": {
         "name": "Small business energy incentive",
+        "direction": "subtract",
         "active": False,
         "removed_in": "2025",
         "auto_supported": False,
@@ -240,8 +276,8 @@ WORKSHEET_2 = {
     },
     "add_back_7Y": {
         "label": "7Y",
-        "direction": "add",
-        "heading": "Build-to-rent capital works deduction at 4%",
+        "direction": "information_only",
+        "heading": "Build-to-rent capital works deduction at 4% (information only)",
     },
 
     "subtract_7F": {
@@ -313,9 +349,9 @@ ITEM_8_LABELS = {
     # ------------------------------------------------------------------
     # Stock / trading
     # ------------------------------------------------------------------
-    "8N": {
+    "8A": {
         "item": 8,
-        "label": "N",
+        "label": "A",
         "description": "Opening stock",
         "entry_type": "amount",
         "source": "Prior year closing stock / stock schedule",
@@ -528,6 +564,26 @@ ITEM_8_LABELS = {
         "automation_status": "review",
         "auto_supported": False,
         "review_note": "Requires related-party review. Do not infer from ordinary wages or contractor accounts alone.",
+    },
+    "8N-fc": {
+        "item": 8,
+        "label": "N",
+        "description": "Functional currency translation rate",
+        "entry_type": "rate",
+        "source": "Functional currency workpaper",
+        "automation_status": "manual",
+        "auto_supported": False,
+        "review_note": "Complete only where a functional currency choice applies.",
+    },
+    "8N-loans": {
+        "item": 8,
+        "label": "N",
+        "description": "Loans to shareholders and their associates",
+        "entry_type": "amount",
+        "source": "Balance sheet and Division 7A review",
+        "automation_status": "review",
+        "auto_supported": False,
+        "review_note": "Confirm debit/credit classification and Division 7A implications.",
     },
     "8G-fi": {
         "item": 8,

@@ -24,14 +24,22 @@ from openpyxl.formula.translate import Translator
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from cleaner import ReportInput
-
-from config import (
-    OUTPUT_PATH,
-    SHEET_BS_RAW,
-    SHEET_PL_RAW,
-    SHEET_RECONCILIATION,
-)
+try:
+    from .cleaner import ReportInput
+    from .config import (
+        OUTPUT_PATH,
+        SHEET_BS_RAW,
+        SHEET_PL_RAW,
+        SHEET_RECONCILIATION,
+    )
+except ImportError:  # Direct-script compatibility.
+    from cleaner import ReportInput
+    from config import (
+        OUTPUT_PATH,
+        SHEET_BS_RAW,
+        SHEET_PL_RAW,
+        SHEET_RECONCILIATION,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -906,23 +914,50 @@ def write_workbook(reports, workpaper) -> None:
     # ------------------------------------------------------------------
     support_start_col = tax_last_col + 2
 
-    current_row, _ = _write_simple_table(
-        ws,
-        workpaper.carry_forward_losses,
-        "Carry Forward Losses",
-        tax_start_row,
-        support_start_col,
-        input_table=True,
-    )
+    current_row = tax_start_row - 3
 
-    current_row, _ = _write_simple_table(
-        ws,
-        workpaper.rd_breakdown,
-        "R&D Breakdown",
-        current_row + 3,
-        support_start_col,
-        input_table=True,
-    )
+    if workpaper.carry_forward_losses is not None and not workpaper.carry_forward_losses.empty:
+        current_row, _ = _write_simple_table(
+            ws,
+            workpaper.carry_forward_losses,
+            "Carry Forward Losses",
+            current_row + 3,
+            support_start_col,
+            input_table=True,
+        )
+
+    if workpaper.rd_breakdown is not None and not workpaper.rd_breakdown.empty:
+        current_row, _ = _write_simple_table(
+            ws,
+            workpaper.rd_breakdown,
+            "R&D Breakdown",
+            current_row + 3,
+            support_start_col,
+            input_table=True,
+        )
+
+    for title, table in getattr(workpaper, "support_tables", {}).items():
+        if table is None or table.empty:
+            continue
+        current_row, _ = _write_simple_table(
+            ws,
+            table,
+            title,
+            current_row + 3,
+            support_start_col,
+            input_table=True,
+        )
+
+    proposed = getattr(workpaper, "proposed_adjustments", None)
+    if proposed is not None and not proposed.empty:
+        current_row, _ = _write_simple_table(
+            ws,
+            proposed,
+            "Proposed Tax Adjustments - Not Posted Unless Approved",
+            current_row + 3,
+            support_start_col,
+            input_table=False,
+        )
 
     if getattr(workpaper, "review_items", None) is not None and not workpaper.review_items.empty:
         _write_simple_table(

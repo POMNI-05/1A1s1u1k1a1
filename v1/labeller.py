@@ -5,26 +5,19 @@ Design:
 - Headings/blanks stay structural.
 - P&L account rows get direct ITR Ref codes where rules can map them.
 - BS account/total rows get direct ITR Ref codes where rules can map them.
+- User/custom overrides are applied after base rule matching.
 - The workbook side column displays ITR Ref directly: 6C, 6A, 8D, etc.
 """
 
 from __future__ import annotations
+
 from importlib import import_module
 
 import pandas as pd
-from proto import module
 
 from job_config import get_policy_year
+from label_overrides import apply_label_override, load_overrides
 
-def _get_matcher():
-    year = str(get_policy_year("2026")).strip()
-
-    if year == "2025":
-        module_name = "itr_rules"
-    else:
-        module_name = f"itr_rules_{year}"
-
-    return module.match_financial_label
 
 LABEL_COLUMNS = [
     "ITR Ref",
@@ -34,10 +27,21 @@ LABEL_COLUMNS = [
     "Review Note",
     "Label Reason",
     "Recon ITR Ref",
+    "Recon Key",
+    "Recon Display Ref",
+    "Recon Direction",
+    "Support Key",
+    "Support Display Ref",
+    "Support Label",
+    "Override Applied",
+    "Override Name",
+    "Override Reason",
 ]
+
 
 def _get_matcher():
     """Return the year-specific ITR labelling function.
+
     File naming rule:
     - 2025 uses legacy v1/itr_rules.py
     - 2026+ can use v1/itr_rules_<year>.py, e.g. itr_rules_2026.py
@@ -50,19 +54,20 @@ def _get_matcher():
         module_name = f"itr_rules_{year}"
 
     try:
-        module = import_module(module_name)
+        rules_module = import_module(module_name)
     except ModuleNotFoundError as exc:
         raise ValueError(
             f"No ITR rules module found for policy year {year}. "
             f"Expected backend file: v1/{module_name}.py"
         ) from exc
 
-    if not hasattr(module, "match_financial_label"):
+    if not hasattr(rules_module, "match_financial_label"):
         raise AttributeError(
             f"Rules module {module_name}.py does not define match_financial_label()."
         )
 
-    return module.match_financial_label
+    return rules_module.match_financial_label
+
 
 def get_account_col(df: pd.DataFrame) -> str:
     for wanted in ["account label", "account", "description", "account name"]:
@@ -87,6 +92,15 @@ def _blank_label(treatment: str = "structure_or_check_only") -> dict:
         "Review Note": "",
         "Label Reason": "",
         "Recon ITR Ref": "",
+        "Recon Key": "",
+        "Recon Display Ref": "",
+        "Recon Direction": "",
+        "Support Key": "",
+        "Support Display Ref": "",
+        "Support Label": "",
+        "Override Applied": "",
+        "Override Name": "",
+        "Override Reason": "",
     }
 
 
@@ -101,6 +115,12 @@ def _normalise_mapping(mapping: dict) -> dict:
     clean["ITR Ref"] = str(clean.get("ITR Ref", "") or "").strip()
     clean["ITR Label"] = str(clean.get("ITR Label", "") or "").strip()
     clean["Recon ITR Ref"] = str(clean.get("Recon ITR Ref", "") or "").strip()
+    clean["Recon Key"] = str(clean.get("Recon Key", "") or "").strip()
+    clean["Recon Display Ref"] = str(clean.get("Recon Display Ref", "") or "").strip()
+    clean["Recon Direction"] = str(clean.get("Recon Direction", "") or "").strip()
+    clean["Support Key"] = str(clean.get("Support Key", "") or "").strip()
+    clean["Support Display Ref"] = str(clean.get("Support Display Ref", "") or "").strip()
+    clean["Support Label"] = str(clean.get("Support Label", "") or "").strip()
 
     return clean
 
@@ -140,12 +160,20 @@ def _net_profit_mapping() -> dict:
         "Review Note": "",
         "Label Reason": "Net profit/profit before tax total row used as reconciliation base.",
         "Recon ITR Ref": "",
+        "Recon Key": "",
+        "Recon Display Ref": "",
+        "Recon Direction": "",
+        "Support Key": "",
+        "Support Display Ref": "",
+        "Support Label": "",
     }
 
 
 def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
     out = df.copy()
     match_financial_label = _get_matcher()
+    user_overrides = load_overrides()
+
     if out.empty:
         return pd.concat(
             [out.reset_index(drop=True), pd.DataFrame(columns=LABEL_COLUMNS)],
@@ -173,16 +201,23 @@ def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
                 or "profit before tax" in str(account_name).lower()
             )
         ):
-            labels.append(_normalise_mapping(_net_profit_mapping()))
-            continue
+            base_mapping = _net_profit_mapping()
+        else:
+            base_mapping = match_financial_label(
+                account_name=account_name,
+                report_type=report_type,
+                report_section=report_section,
+            )
 
-        mapping = match_financial_label(
-            account_name=account_name,
+        final_mapping = apply_label_override(
+            base_mapping,
+            account_name=str(account_name or ""),
             report_type=report_type,
-            report_section=report_section,
+            report_section=str(report_section or ""),
+            overrides=user_overrides,
         )
 
-        labels.append(_normalise_mapping(mapping))
+        labels.append(_normalise_mapping(final_mapping))
 
     label_df = pd.DataFrame(labels)
 
@@ -203,11 +238,13 @@ def rows_requiring_highlight(labelled_df: pd.DataFrame) -> pd.DataFrame:
     confidence = labelled_df.get("Confidence", "").astype(str).str.lower()
     treatment = labelled_df.get("Treatment", "").astype(str).str.lower()
     itr_ref = labelled_df.get("ITR Ref", "").astype(str)
+    override_applied = labelled_df.get("Override Applied", "").astype(str).str.lower()
 
     return labelled_df[
         confidence.isin(["medium", "low"])
         | treatment.eq("review_only")
         | itr_ref.eq("Review")
+        | override_applied.eq("yes")
     ].copy()
 
 
@@ -236,6 +273,8 @@ def extract_review_items(labelled_df: pd.DataFrame, source: str = "") -> pd.Data
                 "Recon ITR Ref",
                 "Review Note",
                 "Reason",
+                "Override Applied",
+                "Override Name",
             ]
         )
 
@@ -250,5 +289,7 @@ def extract_review_items(labelled_df: pd.DataFrame, source: str = "") -> pd.Data
             "Recon ITR Ref": review_rows.get("Recon ITR Ref", ""),
             "Review Note": review_rows.get("Review Note", ""),
             "Reason": review_rows.get("Label Reason", ""),
+            "Override Applied": review_rows.get("Override Applied", ""),
+            "Override Name": review_rows.get("Override Name", ""),
         }
     )

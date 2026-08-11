@@ -108,6 +108,13 @@ def _build_label_summary(
     - Cash / bank support
     - Current asset support
     still appear in the summary.
+
+    Safety:
+    - Uploaded workbooks may already contain old ITR/output columns.
+    - labeller.py then appends fresh ITR columns.
+    - If duplicate column names exist, rows["ITR Ref"] returns a DataFrame,
+      not a Series, causing: AttributeError: 'DataFrame' object has no attribute 'str'.
+    - This function removes duplicate columns defensively before string operations.
     """
     columns = [
         "Source",
@@ -124,12 +131,17 @@ def _build_label_summary(
     if labelled_df is None or labelled_df.empty:
         return pd.DataFrame(columns=columns)
 
-    amount_cols = _detect_amount_cols(labelled_df)
+    rows = labelled_df.copy()
+
+    # Defensive cleanup: duplicate columns can happen when source files already
+    # contain old generated labels such as ITR Ref / Review Note.
+    rows = rows.loc[:, ~rows.columns.duplicated()].copy()
+
+    amount_cols = _detect_amount_cols(rows)
     if not amount_cols:
         return pd.DataFrame(columns=columns)
 
     amount_col = amount_cols[0]
-    rows = labelled_df.copy()
 
     if "Row Type" in rows.columns:
         rows = rows[
@@ -150,7 +162,13 @@ def _build_label_summary(
         if col not in rows.columns:
             rows[col] = ""
 
-        rows[col] = rows[col].astype(str).str.strip()
+        # Extra defensive guard: if duplicate columns survived for any reason,
+        # take the first matching column as a Series.
+        value = rows[col]
+        if isinstance(value, pd.DataFrame):
+            value = value.iloc[:, 0]
+
+        rows[col] = value.astype(str).str.strip()
 
     rows = rows[rows["Workpaper Label"].ne("")].copy()
     rows = rows[rows["ITR Ref"].ne("Review")].copy()
@@ -163,6 +181,10 @@ def _build_label_summary(
 
     rows["_Amount"] = rows[amount_col].apply(clean_amount)
 
+    # Source Row may be missing in some imported/legacy reports.
+    if "Source Row" not in rows.columns:
+        rows["Source Row"] = ""
+
     grouped = (
         rows.groupby(
             ["Workpaper Label", "ITR Ref", "ITR Label", "Treatment"],
@@ -172,7 +194,12 @@ def _build_label_summary(
             Amount=("_Amount", "sum"),
             Confidence=("Confidence", lambda s: _worst_confidence(s.tolist())),
             Review_Note=("Review Note", lambda s: "; ".join(sorted({x for x in s if x}))),
-            Source_Rows=("Source Row", lambda s: ", ".join(str(int(x)) for x in s if pd.notna(x))),
+            Source_Rows=(
+                "Source Row",
+                lambda s: ", ".join(
+                    str(int(x)) for x in s if pd.notna(x) and str(x).strip() != ""
+                ),
+            ),
         )
         .reset_index()
     )

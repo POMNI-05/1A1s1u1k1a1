@@ -39,6 +39,8 @@ LICENSE
 # Ignore generated frontend files
 frontend/uploads/*
 frontend/downloads/*
+frontend/jobs/*
+.pytest_cache/
 
 # But keep the folder placeholders
 !frontend/uploads/.gitkeep

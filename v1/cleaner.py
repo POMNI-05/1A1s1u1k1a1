@@ -24,7 +24,23 @@ from typing import Iterable
 
 import pandas as pd
 
-from config import (
+try:
+    from .config import (
+        ALLOW_COMBINED_WORKBOOK,
+        BS_RAW_PATH,
+        BS_SHEET_NAME,
+        INPUT_WORKBOOK_PATH,
+        PL_RAW_PATH,
+        PL_SHEET_NAME,
+        REPORT_TYPE_BS,
+        REPORT_TYPE_PL,
+        REPORT_TYPE_TAX_DEPRECIATION,
+        REPORT_TYPE_UNKNOWN,
+        TAX_DEPRECIATION_PATH,
+        TAX_DEPRECIATION_SHEET_NAME,
+    )
+except ImportError:  # Direct-script compatibility.
+    from config import (
     ALLOW_COMBINED_WORKBOOK,
     BS_RAW_PATH,
     BS_SHEET_NAME,
@@ -37,7 +53,7 @@ from config import (
     REPORT_TYPE_UNKNOWN,
     TAX_DEPRECIATION_PATH,
     TAX_DEPRECIATION_SHEET_NAME,
-)
+    )
 
 logger = logging.getLogger(__name__)
 

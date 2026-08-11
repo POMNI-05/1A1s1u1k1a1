@@ -3,15 +3,12 @@
 Bridge between Streamlit UI and v1 backend.
 
 Stable design:
-- Save uploaded Excel files into frontend/uploads/job_xxx/.
-- Clear old Excel files from v1/data/.
-- Copy uploaded Excel files into v1/data/.
-- Write frontend-selected tax settings into v1/job_config.json.
-- Run v1/main.py as a subprocess, same as the working backend terminal test.
-- Pass selected ATO / ITR policy year through environment variables.
-- Find newest Excel output from v1/output/.
+- Give every request its own UUID-scoped inputs, output, logs and config.
+- Run the backend package as an isolated subprocess.
+- Pass selected ATO / ITR policy and owned paths through environment variables.
 - Optionally run a Gemini face-check against user inputs + workbook summary.
-- Copy backend output into frontend/downloads/ for Streamlit download.
+- Copy the owned output into a session-scoped download history.
+- Remove transient job files by default.
 
 This avoids calling backend internals directly and avoids tuple/reports mismatch.
 """
@@ -25,9 +22,13 @@ import shutil
 import subprocess
 import sys
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
+
+from tax_calculators.company_tax import assess_base_rate_entity
+from tax_calculators.validation import CalculatorError, to_decimal
 
 
 try:
@@ -44,23 +45,20 @@ V1_DIR = ROOT_DIR / "v1"
 
 UPLOADS_DIR = FRONTEND_DIR / "uploads"
 DOWNLOADS_DIR = FRONTEND_DIR / "downloads"
+JOBS_DIR = FRONTEND_DIR / "jobs"
 
-V1_DATA_DIR = V1_DIR / "data"
-V1_OUTPUT_DIR = V1_DIR / "output"
 V1_MAIN_PATH = V1_DIR / "main.py"
-V1_JOB_CONFIG_PATH = V1_DATA_DIR / "job_config.json"
 
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
-V1_DATA_DIR.mkdir(parents=True, exist_ok=True)
-V1_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 logger = logging.getLogger(__name__)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-VALID_POLICY_YEARS = {"2025", "2026"}
+VALID_POLICY_YEARS = {"2024", "2025", "2026"}
 
 DEFAULT_REQUESTED_TABLES: dict[str, bool] = {
     "carry_forward_losses": False,
@@ -73,9 +71,6 @@ DEFAULT_REQUESTED_TABLES: dict[str, bool] = {
     "related_party_loans": False,
     "psi": False,
 }
-
-EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
-
 
 # ── Basic helpers ─────────────────────────────────────────────────────────────
 
@@ -135,71 +130,19 @@ def _save_uploaded_file(uploaded_file: BinaryIO, dest_dir: Path, index: int) -> 
     return dest
 
 
-def _clear_excel_files(folder: Path) -> list[Path]:
-    """
-    Clears old Excel inputs from v1/data.
-
-    Does not delete folders, .gitkeep, processed/, logs, etc.
-    """
-    removed: list[Path] = []
-
-    if not folder.exists():
-        folder.mkdir(parents=True, exist_ok=True)
-        return removed
-
-    for path in folder.iterdir():
-        if path.is_file() and path.suffix.lower() in EXCEL_SUFFIXES:
-            path.unlink()
-            removed.append(path)
-            logger.info("Removed old Excel file: %s", path)
-
-    return removed
-
-
-def _copy_inputs_to_v1_data(saved_inputs: list[Path]) -> list[Path]:
-    copied: list[Path] = []
-
-    for source in saved_inputs:
-        dest = V1_DATA_DIR / source.name
-        shutil.copy2(source, dest)
-        copied.append(dest)
-        logger.info("Copied upload into v1/data: %s", dest)
-
-    return copied
-
-
-def _latest_output_after(start_time: float) -> Path | None:
-    candidates: list[Path] = []
-
-    if not V1_OUTPUT_DIR.exists():
-        return None
-
-    for path in V1_OUTPUT_DIR.glob("*.xlsx"):
-        if not path.is_file():
-            continue
-
-        # Ignore temporary Excel lock files.
-        if path.name.startswith("~$"):
-            continue
-
-        if path.stat().st_mtime >= start_time:
-            candidates.append(path)
-
-    if not candidates:
-        return None
-
-    return max(candidates, key=lambda p: p.stat().st_mtime)
-
-
 def _copy_backend_output_to_downloads(
     backend_output: Path,
     client_name: str = "",
+    history_owner_id: str = "local",
 ) -> tuple[Path, str]:
     safe_client = _safe_client_name(client_name)
     prefix = f"{safe_client}_" if safe_client else ""
     output_name = f"{prefix}workpaper_{_timestamp()}.xlsx"
 
-    frontend_output = DOWNLOADS_DIR / output_name
+    safe_owner = _safe_client_name(history_owner_id) or "local"
+    owner_download_dir = DOWNLOADS_DIR / safe_owner
+    owner_download_dir.mkdir(parents=True, exist_ok=True)
+    frontend_output = owner_download_dir / output_name
     shutil.copy2(backend_output, frontend_output)
 
     logger.info("Copied backend output to frontend downloads: %s", frontend_output)
@@ -263,6 +206,65 @@ def _normalise_policy_year(ato_policy_year: str = "2026") -> str:
     return year
 
 
+def build_base_rate_entity_assessment(
+    income_year: str,
+    *,
+    aggregated_turnover: float | int | str,
+    total_assessable_income: float | int | str,
+    base_rate_entity_passive_income: float | int | str,
+    reviewer_confirmed: bool = False,
+) -> dict[str, Any]:
+    """Return a JSON-safe assessment for the frontend and job audit record."""
+
+    assessment = assess_base_rate_entity(
+        _normalise_policy_year(income_year),
+        aggregated_turnover=aggregated_turnover,
+        total_assessable_income=total_assessable_income,
+        base_rate_entity_passive_income=base_rate_entity_passive_income,
+    )
+    return {
+        "income_year": assessment.income_year,
+        "aggregated_turnover": str(aggregated_turnover),
+        "total_assessable_income": str(total_assessable_income),
+        "base_rate_entity_passive_income": str(base_rate_entity_passive_income),
+        "passive_income_ratio": str(assessment.passive_income_ratio),
+        "turnover_threshold": str(assessment.turnover_threshold),
+        "passive_income_ratio_limit": str(assessment.passive_income_ratio_limit),
+        "turnover_below_threshold": assessment.turnover_below_threshold,
+        "passive_income_ratio_within_limit": (
+            assessment.passive_income_ratio_within_limit
+        ),
+        "eligible_on_supplied_figures": assessment.eligible_on_supplied_figures,
+        "reviewer_confirmed": reviewer_confirmed is True,
+    }
+
+
+def _base_rate_assessment_is_confirmed(
+    assessment: dict[str, Any] | None,
+    income_year: str,
+) -> bool:
+    if not assessment or assessment.get("reviewer_confirmed") is not True:
+        return False
+    try:
+        if to_decimal(
+            assessment.get("total_assessable_income"),
+            "total_assessable_income",
+        ) <= 0:
+            return False
+        verified = build_base_rate_entity_assessment(
+            income_year,
+            aggregated_turnover=assessment.get("aggregated_turnover"),
+            total_assessable_income=assessment.get("total_assessable_income"),
+            base_rate_entity_passive_income=assessment.get(
+                "base_rate_entity_passive_income"
+            ),
+            reviewer_confirmed=True,
+        )
+    except (CalculatorError, TypeError, ValueError):
+        return False
+    return verified["eligible_on_supplied_figures"] is True
+
+
 def _build_job_options(
     ato_policy_year: str = "2026",
     requested_tables: dict[str, bool] | None = None,
@@ -270,8 +272,17 @@ def _build_job_options(
     company_profile: str = "",
     document_description: str = "",
     client_name: str = "",
+    company_tax_rate_category: str = "review_required",
+    base_rate_entity_assessment: dict[str, Any] | None = None,
+    retain_job_files: bool = False,
 ) -> dict[str, Any]:
     year = _normalise_policy_year(ato_policy_year)
+    rate_category = company_tax_rate_category
+    if rate_category == "base_rate_entity" and not _base_rate_assessment_is_confirmed(
+        base_rate_entity_assessment,
+        year,
+    ):
+        rate_category = "review_required"
 
     return {
         "ato_policy_year": year,
@@ -281,49 +292,72 @@ def _build_job_options(
         "company_profile": company_profile or "",
         "document_description": document_description or "",
         "client_name": client_name or "",
+        "company_tax_rate_category": (
+            rate_category
+            if rate_category in {"base_rate_entity", "general"}
+            else "review_required"
+        ),
+        "base_rate_entity_assessment": base_rate_entity_assessment or {},
+        "retain_job_files": bool(retain_job_files),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source": "frontend/job_runner.py",
     }
 
 
-def _write_job_config(job_options: dict[str, Any]) -> Path:
+def _write_job_config(job_options: dict[str, Any], path: Path) -> Path:
     """
     Writes frontend-selected settings for v1/main.py, itr_rules.py, ato_policy.py,
     workpaper_builder.py, write_workbook.py, etc.
 
-    Backend can read:
-        v1/job_config.json
+    Backend reads the per-job config path supplied below.
 
     Backend subprocess also receives:
         ATO_POLICY_YEAR
         ITR_POLICY_YEAR
         TAX_JOB_CONFIG_PATH
     """
-    V1_JOB_CONFIG_PATH.write_text(
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
         json.dumps(job_options, indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
-    logger.info("Wrote backend job config: %s", V1_JOB_CONFIG_PATH)
-    return V1_JOB_CONFIG_PATH
+    logger.info("Wrote backend job config: %s", path)
+    return path
 
 
 # ── Backend subprocess ────────────────────────────────────────────────────────
 
-def _run_v1_main(job_options: dict[str, Any] | None = None) -> subprocess.CompletedProcess:
+def _run_v1_main(
+    job_options: dict[str, Any],
+    *,
+    job_root: Path,
+    input_dir: Path,
+    output_path: Path,
+    log_dir: Path,
+    job_config_path: Path,
+) -> subprocess.CompletedProcess:
     if not V1_MAIN_PATH.exists():
         raise FileNotFoundError(f"Cannot find backend main.py at: {V1_MAIN_PATH}")
 
     env = os.environ.copy()
 
-    if job_options:
-        env["ATO_POLICY_YEAR"] = str(job_options.get("ato_policy_year", "2026"))
-        env["ITR_POLICY_YEAR"] = str(job_options.get("itr_policy_year", "2026"))
-        env["TAX_JOB_CONFIG_PATH"] = str(V1_JOB_CONFIG_PATH)
+    env["ATO_POLICY_YEAR"] = str(job_options.get("ato_policy_year", "2026"))
+    env["ITR_POLICY_YEAR"] = str(job_options.get("itr_policy_year", "2026"))
+    env["SELECTED_INCOME_YEAR"] = str(job_options.get("ato_policy_year", "2026"))
+    env["COMPANY_TAX_RATE_CATEGORY"] = str(
+        job_options.get("company_tax_rate_category", "review_required")
+    )
+    env["TAX_JOB_CONFIG_PATH"] = str(job_config_path)
+    env["TAX_JOB_WORK_DIR"] = str(job_root)
+    env["TAX_DATA_DIR"] = str(input_dir)
+    env["TAX_OUTPUT_DIR"] = str(output_path.parent)
+    env["TAX_OUTPUT_PATH"] = str(output_path)
+    env["TAX_LOG_DIR"] = str(log_dir)
 
     return subprocess.run(
-        [sys.executable, str(V1_MAIN_PATH)],
-        cwd=str(V1_DIR),
+        [sys.executable, "-m", "v1.main"],
+        cwd=str(ROOT_DIR),
         text=True,
         capture_output=True,
         check=False,
@@ -395,6 +429,8 @@ def _run_gemini_face_check(
     backend_output: Path,
     stdout: str = "",
     stderr: str = "",
+    api_key: str = "",
+    model: str = "gemini-2.5-flash",
 ) -> dict[str, str]:
     """
     Optional AI review pass.
@@ -402,18 +438,17 @@ def _run_gemini_face_check(
     Requires:
         pip install -U google-genai
 
-    Environment:
-        GEMINI_API_KEY=...
-        Optional: GEMINI_MODEL=gemini-2.5-flash
+    The API key and model are supplied explicitly by the current request.
 
     This is a face-check only. It should not replace accountant review.
     """
-    if not os.getenv("GEMINI_API_KEY") and not os.getenv("GOOGLE_API_KEY"):
+    api_key = str(api_key or "").strip()
+    if not api_key:
         return {
             "status": "skipped",
             "summary": (
-                "Gemini face-check skipped because GEMINI_API_KEY / GOOGLE_API_KEY "
-                "is not set in the environment."
+                "Gemini face-check skipped because no API key was supplied for "
+                "this request."
             ),
         }
 
@@ -476,10 +511,10 @@ Return format:
 """
 
     try:
-        client = genai.Client()
+        client = genai.Client(api_key=api_key)
 
         response = client.models.generate_content(
-            model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
+            model=model or "gemini-2.5-flash",
             contents=prompt,
         )
 
@@ -532,6 +567,13 @@ def run_workpaper_job(
     requested_tables: dict[str, bool] | None = None,
     reviewer_notes: str = "",
     run_ai_face_check: bool = False,
+    company_tax_rate_category: str = "review_required",
+    base_rate_entity_assessment: dict[str, Any] | None = None,
+    history_owner_id: str = "local",
+    ai_provider: str = "None",
+    ai_model: str = "",
+    ai_api_key: str = "",
+    retain_job_files: bool = False,
 ) -> dict[str, Any]:
     """
     Run the working v1 backend from Streamlit uploads.
@@ -568,7 +610,11 @@ def run_workpaper_job(
         "job_config_path": "",
         "ai_face_check": None,
         "error_message": None,
+        "job_id": "",
+        "job_cleaned_up": False,
     }
+
+    job_root: Path | None = None
 
     try:
         # 0. Build frontend-selected job options.
@@ -579,6 +625,9 @@ def run_workpaper_job(
             company_profile=company_profile,
             document_description=document_description,
             client_name=client_name,
+            company_tax_rate_category=company_tax_rate_category,
+            base_rate_entity_assessment=base_rate_entity_assessment,
+            retain_job_files=retain_job_files,
         )
 
         result["job_options"] = job_options
@@ -594,9 +643,17 @@ def run_workpaper_job(
             return result
 
         # 1. Save frontend uploads into timestamped folder.
-        job_id = _timestamp()
-        job_upload_dir = UPLOADS_DIR / f"job_{job_id}"
+        job_id = f"{_timestamp()}_{uuid.uuid4().hex}"
+        result["job_id"] = job_id
+        job_root = JOBS_DIR / job_id
+        job_upload_dir = job_root / "inputs"
+        job_output_dir = job_root / "output"
+        job_log_dir = job_root / "logs"
+        job_config_path = job_root / "job_config.json"
+        backend_output = job_output_dir / "tax_workpaper.xlsx"
         job_upload_dir.mkdir(parents=True, exist_ok=True)
+        job_output_dir.mkdir(parents=True, exist_ok=True)
+        job_log_dir.mkdir(parents=True, exist_ok=True)
 
         saved_inputs = [
             _save_uploaded_file(uploaded_file, job_upload_dir, index)
@@ -606,22 +663,24 @@ def run_workpaper_job(
         result["uploaded_files"] = [path.name for path in saved_inputs]
         result["frontend_upload_paths"] = [str(path) for path in saved_inputs]
 
-        # 2. Clear old backend Excel inputs.
-        _clear_excel_files(V1_DATA_DIR)
-
-        # 3. Copy current uploads into v1/data.
-        copied_inputs = _copy_inputs_to_v1_data(saved_inputs)
-        result["backend_data_paths"] = [str(path) for path in copied_inputs]
+        # Inputs already live in this job's isolated backend data directory.
+        result["backend_data_paths"] = [str(path) for path in saved_inputs]
 
         # 3b. Write frontend-selected tax settings for backend.
-        job_config_path = _write_job_config(job_options)
+        job_config_path = _write_job_config(job_options, job_config_path)
         result["job_config_path"] = str(job_config_path)
 
-        # 4. Run backend exactly like Terminal, with policy-year env vars.
-        start_time = datetime.now().timestamp()
-        result["backend_command"] = f"{sys.executable} {V1_MAIN_PATH}"
+        # 4. Run the backend package with this job's isolated paths.
+        result["backend_command"] = f"{sys.executable} -m v1.main"
 
-        completed = _run_v1_main(job_options)
+        completed = _run_v1_main(
+            job_options,
+            job_root=job_root,
+            input_dir=job_upload_dir,
+            output_path=backend_output,
+            log_dir=job_log_dir,
+            job_config_path=job_config_path,
+        )
 
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""
@@ -639,13 +698,11 @@ def run_workpaper_job(
                 stderr,
             )
 
-        # 5. Find newest output generated by backend.
-        backend_output = _latest_output_after(start_time)
-
-        if backend_output is None:
+        # 5. Use the output owned by this job only.
+        if not backend_output.exists():
             return _build_error_result(
                 result,
-                "Backend completed, but no new Excel output was found in v1/output.",
+                "Backend completed, but this job's Excel output was not found.",
                 stdout,
                 stderr,
             )
@@ -654,12 +711,20 @@ def run_workpaper_job(
 
         # 5b. Optional Gemini face-check before copying final download.
         if run_ai_face_check:
-            result["ai_face_check"] = _run_gemini_face_check(
-                job_options=job_options,
-                backend_output=backend_output,
-                stdout=stdout,
-                stderr=stderr,
-            )
+            if ai_provider != "Gemini":
+                result["ai_face_check"] = {
+                    "status": "skipped",
+                    "summary": "Only Gemini face-check is currently supported.",
+                }
+            else:
+                result["ai_face_check"] = _run_gemini_face_check(
+                    job_options=job_options,
+                    backend_output=backend_output,
+                    stdout=stdout,
+                    stderr=stderr,
+                    api_key=ai_api_key,
+                    model=ai_model,
+                )
         else:
             result["ai_face_check"] = {
                 "status": "skipped",
@@ -670,6 +735,7 @@ def run_workpaper_job(
         frontend_output, output_name = _copy_backend_output_to_downloads(
             backend_output,
             client_name=client_name,
+            history_owner_id=history_owner_id,
         )
 
         result.update(
@@ -691,3 +757,11 @@ def run_workpaper_job(
         )
 
         return result
+
+    finally:
+        if job_root is not None and job_root.exists() and not retain_job_files:
+            try:
+                shutil.rmtree(job_root)
+                result["job_cleaned_up"] = True
+            except Exception:
+                logger.exception("Could not clean isolated job directory: %s", job_root)

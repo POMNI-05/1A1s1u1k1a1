@@ -5,11 +5,18 @@ import logging
 import sys
 import traceback
 
-from cleaner import load_clean_report_bundle
-from config import OUTPUT_PATH
-from utils import ensure_dirs, setup_logging
-from workpaper_builder import build_workpaper
-from write_workbook import write_workbook
+try:
+    from .cleaner import load_clean_report_bundle
+    from .config import OUTPUT_PATH
+    from .utils import ensure_dirs, setup_logging
+    from .workpaper_builder import build_workpaper
+    from .write_workbook import write_workbook
+except ImportError:  # Direct-script compatibility.
+    from cleaner import load_clean_report_bundle
+    from config import OUTPUT_PATH
+    from utils import ensure_dirs, setup_logging
+    from workpaper_builder import build_workpaper
+    from write_workbook import write_workbook
 
 logger = logging.getLogger(__name__)
 

@@ -19,10 +19,10 @@ Design:
 from __future__ import annotations
 
 import json
-import os
 import sys
 import urllib.error
 import urllib.request
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -40,7 +40,7 @@ if str(FRONTEND_DIR) not in sys.path:
     sys.path.insert(0, str(FRONTEND_DIR))
 
 import ui_text as T
-from job_runner import run_workpaper_job
+from job_runner import build_base_rate_entity_assessment, run_workpaper_job
 from override_editor import (
     append_override,
     build_override_from_form,
@@ -62,24 +62,16 @@ OPTIONAL_TABLES = {
     "superannuation": "Superannuation timing table",
     "gst_reconciliation": "GST / BAS reconciliation table",
     "related_party_loans": "Related party loan table",
+    "psi": "Personal services income review table",
 }
 
-AI_PROVIDER_OPTIONS = ["None", "Gemini", "OpenAI", "Claude"]
+AI_PROVIDER_OPTIONS = ["None", "Gemini"]
 
 AI_MODEL_OPTIONS = {
     "Gemini": [
         "gemini-2.5-flash",
         "gemini-2.5-pro",
         "gemini-1.5-flash",
-    ],
-    "OpenAI": [
-        "gpt-4.1-mini",
-        "gpt-4.1",
-        "gpt-4o-mini",
-    ],
-    "Claude": [
-        "claude-3-5-sonnet-latest",
-        "claude-3-5-haiku-latest",
     ],
 }
 
@@ -89,46 +81,15 @@ RULE_CONTEXT_MAX_CHARS = 45_000
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-def _apply_ai_environment(
-    *,
-    ai_provider: str,
-    ai_model: str,
-    api_key: str,
-    run_ai_face_check: bool,
-) -> None:
-    """Apply AI settings for the backend subprocess."""
-
-    os.environ["ENABLE_GEMINI_REVIEW"] = "false"
-    os.environ["ENABLE_OPENAI_REVIEW"] = "false"
-    os.environ["ENABLE_CLAUDE_REVIEW"] = "false"
-
-    if not run_ai_face_check or ai_provider == "None" or not api_key:
-        return
-
-    if ai_provider == "Gemini":
-        os.environ["GEMINI_API_KEY"] = api_key
-        os.environ["GEMINI_MODEL"] = ai_model
-        os.environ["ENABLE_GEMINI_REVIEW"] = "true"
-
-    elif ai_provider == "OpenAI":
-        os.environ["OPENAI_API_KEY"] = api_key
-        os.environ["OPENAI_MODEL"] = ai_model
-        os.environ["ENABLE_OPENAI_REVIEW"] = "true"
-
-    elif ai_provider == "Claude":
-        os.environ["ANTHROPIC_API_KEY"] = api_key
-        os.environ["CLAUDE_MODEL"] = ai_model
-        os.environ["ENABLE_CLAUDE_REVIEW"] = "true"
-
-
-def _list_previous_workpapers() -> list[Path]:
-    """Return previously generated workpapers from frontend/downloads/."""
-    if not DOWNLOADS_DIR.exists():
+def _list_previous_workpapers(history_owner_id: str) -> list[Path]:
+    """Return workpapers owned by the current Streamlit session."""
+    owner_dir = DOWNLOADS_DIR / history_owner_id
+    if not owner_dir.exists():
         return []
 
     files = [
         path
-        for path in DOWNLOADS_DIR.glob("*.xlsx")
+        for path in owner_dir.glob("*.xlsx")
         if path.is_file() and not path.name.startswith("~$")
     ]
 
@@ -204,6 +165,9 @@ def _save_history_metadata(
     ai_provider: str,
     ai_model: str,
     run_ai_face_check: bool,
+    company_tax_rate_category: str,
+    base_rate_entity_assessment: dict[str, Any],
+    requested_tables: dict[str, bool],
 ) -> None:
     """Save user inputs beside the generated workbook for history review."""
 
@@ -239,6 +203,9 @@ def _save_history_metadata(
         "ai_provider": ai_provider,
         "ai_model": ai_model,
         "run_ai_face_check": bool(run_ai_face_check),
+        "company_tax_rate_category": company_tax_rate_category,
+        "base_rate_entity_assessment": base_rate_entity_assessment,
+        "requested_tables": requested_tables,
         "detected": result.get("detected", {}),
         "warnings": result.get("warnings", []),
     }
@@ -471,7 +438,7 @@ def _fallback_revision_explanation(question: str) -> str:
         "**Question received.**\n\n"
         f"> *{question.strip()}*\n\n"
         "No Gemini explanation was available for this run. For a full rule-based explanation, "
-        "turn on Gemini in Admin and enter a Gemini API key. The fallback answer checks only "
+        "select Gemini in AI API input and enter a Gemini API key. The fallback answer checks only "
         "basic built-in keywords.\n\n"
         "For manual review, check:\n"
         "- the **Review note** column in the workpaper\n"
@@ -539,6 +506,36 @@ def _render_metadata_block(metadata: dict[str, Any]) -> None:
     st.markdown("**ATO / ITR policy year**")
     st.write(metadata.get("ato_policy_year") or "—")
 
+    st.markdown("**Company tax rate assessment**")
+    rate_category = metadata.get("company_tax_rate_category") or "review_required"
+    st.write(
+        {
+            "base_rate_entity": "25% — confirmed base rate entity",
+            "general": "30% — other company",
+            "review_required": "Not confirmed — tax payable not calculated",
+        }.get(rate_category, rate_category)
+    )
+    base_rate_assessment = metadata.get("base_rate_entity_assessment") or {}
+    if base_rate_assessment:
+        st.caption(
+            "Aggregated turnover: "
+            f"${base_rate_assessment.get('aggregated_turnover', '—')} · "
+            "Assessable income: "
+            f"${base_rate_assessment.get('total_assessable_income', '—')} · "
+            "Passive income: "
+            f"${base_rate_assessment.get('base_rate_entity_passive_income', '—')}"
+        )
+        ratio = base_rate_assessment.get("passive_income_ratio")
+        ratio_text = "—"
+        try:
+            ratio_text = f"{float(ratio):.2%}"
+        except (TypeError, ValueError):
+            pass
+        st.caption(
+            f"Passive-income ratio: {ratio_text} · Reviewer confirmed: "
+            f"{'Yes' if base_rate_assessment.get('reviewer_confirmed') is True else 'No'}"
+        )
+
     uploaded = metadata.get("uploaded_files") or []
     st.markdown("**Uploaded files**")
     if uploaded:
@@ -546,6 +543,251 @@ def _render_metadata_block(metadata: dict[str, Any]) -> None:
             st.caption(f"• {name}")
     else:
         st.caption("—")
+
+
+def _render_detected_and_warnings(result: dict[str, Any]) -> None:
+    """Render detected reports and backend warnings."""
+
+    st.markdown('<div class="section-header">Detected reports and backend warnings</div>', unsafe_allow_html=True)
+
+    col_det, col_warn = st.columns(2)
+
+    with col_det:
+        st.markdown(f"**{T.DETECTED_HEADER}**")
+        detected = result.get("detected", {})
+        if detected:
+            for name, found in detected.items():
+                badge_cls = "badge-green" if found else "badge-grey"
+                icon = "✓" if found else "–"
+                st.markdown(
+                    f'<span class="badge {badge_cls}">{icon} {name}</span>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.caption("No detection summary returned.")
+
+    with col_warn:
+        warnings = result.get("warnings", [])
+        st.markdown(f"**{T.WARNINGS_HEADER}**")
+
+        if warnings:
+            for warning in warnings:
+                st.markdown(
+                    f'<span class="badge badge-warning">⚠ {warning}</span>',
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.markdown(
+                f'<span class="badge badge-green">✓ {T.WARNINGS_NONE}</span>',
+                unsafe_allow_html=True,
+            )
+
+
+def _render_rule_question_box(
+    *,
+    result: dict[str, Any],
+    metadata: dict[str, Any],
+    text_area_key: str,
+    button_label: str,
+    button_key: str,
+) -> None:
+    """Render Gemini/fallback question box."""
+
+    st.markdown('<div class="section-header">Ask why the system labelled something</div>', unsafe_allow_html=True)
+
+    revision_text = st.text_area(
+        "Ask Gemini to explain the ITR label using itr_rules.py / itr_rules_2026.py",
+        placeholder=(
+            "Example: Why did consulting income map to 6C? "
+            "Why was depreciation added back? "
+            "Why is this account marked Review?"
+        ),
+        help=(
+            "If Gemini is configured in AI API input, the app reads the relevant ITR rules file "
+            "and asks Gemini to explain the rule logic. Otherwise it uses a simple fallback."
+        ),
+        height=110,
+        key=text_area_key,
+        label_visibility="collapsed",
+    )
+
+    if st.button(button_label, use_container_width=True, key=button_key):
+        if not revision_text.strip():
+            st.warning("Please enter a question or revision request.")
+        else:
+            st.session_state.revision_response = _handle_revision_question(
+                question=revision_text,
+                result=result,
+                metadata=metadata,
+                policy_year=metadata.get("ato_policy_year", "2026"),
+                ai_provider=st.session_state.get("AI_PROVIDER", "None"),
+                ai_model=st.session_state.get("AI_MODEL", "gemini-2.5-flash"),
+                api_key=st.session_state.get("AI_API_KEY", ""),
+            )
+            st.rerun()
+
+    if st.session_state.revision_response:
+        st.markdown(
+            """
+            <div style="background:#f0f4ff;border:1px solid #c8d6f5;border-radius:6px;
+                        padding:1rem 1.2rem;margin-top:0.8rem;font-size:0.88rem;">
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(st.session_state.revision_response)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def _render_custom_override_box() -> None:
+    """Render custom ITR override UI."""
+
+    st.markdown('<div class="section-header">Custom ITR override</div>', unsafe_allow_html=True)
+
+    st.caption(
+        "Use this when a labelled account is wrong. "
+        "Generate the workpaper again to apply the change."
+    )
+
+    with st.expander("Add custom override", expanded=False):
+        report_type = st.selectbox(
+            "Report type",
+            ["profit_and_loss", "balance_sheet"],
+            index=0,
+            key="override_report_type",
+        )
+
+        match_type = st.selectbox(
+            "Match type",
+            ["contains", "exact", "regex"],
+            index=0,
+            key="override_match_type",
+        )
+
+        account_pattern = st.text_input(
+            "Account pattern",
+            placeholder="Example: bank fees / consulting income / depreciation",
+            key="override_account_pattern",
+        )
+
+        section_pattern = st.text_input(
+            "Optional section pattern",
+            placeholder="Example: income / operating expenses / current assets",
+            key="override_section_pattern",
+        )
+
+        override_name = st.text_input(
+            "Override name",
+            placeholder="Example: Bank fees to review",
+            key="override_name",
+        )
+
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            itr_ref = st.text_input(
+                "New ITR Ref",
+                placeholder="Example: Review / Inc - 6C / Exp - 6S",
+                key="override_itr_ref",
+            )
+
+            treatment = st.selectbox(
+                "Treatment",
+                [
+                    "financial_label_only",
+                    "review_only",
+                    "support_only",
+                    "unmapped",
+                ],
+                index=1,
+                key="override_treatment",
+            )
+
+        with col_b:
+            itr_label = st.text_input(
+                "New ITR Label",
+                placeholder="Example: User override - review bank fees",
+                key="override_itr_label",
+            )
+
+            confidence = st.selectbox(
+                "Confidence",
+                ["high", "medium", "low"],
+                index=0,
+                key="override_confidence",
+            )
+
+        review_note = st.text_area(
+            "Review note",
+            placeholder="Example: User override: force this account to review.",
+            key="override_review_note",
+        )
+
+        override_reason = st.text_area(
+            "Reason",
+            placeholder="Example: Accountant reviewed this account and confirmed the base rule was not appropriate.",
+            key="override_reason",
+        )
+
+        save_override_clicked = st.button(
+            "Save custom override",
+            use_container_width=True,
+            key="save_custom_override",
+        )
+
+        if save_override_clicked:
+            try:
+                override = build_override_from_form(
+                    name=override_name,
+                    report_type=report_type,
+                    account_pattern=account_pattern,
+                    match_type=match_type,
+                    itr_ref=itr_ref,
+                    itr_label=itr_label,
+                    treatment=treatment,
+                    confidence=confidence,
+                    review_note=review_note,
+                    reason=override_reason,
+                    section_pattern=section_pattern,
+                )
+
+                append_override(override)
+
+                st.success(
+                    "Custom override saved. Click Generate workpaper again to apply it."
+                )
+
+                st.json(override)
+
+            except Exception as exc:
+                st.error(f"Could not save override: {exc}")
+
+    with st.expander("Current custom overrides", expanded=False):
+        override_doc = load_override_doc()
+        st.json(override_doc)
+
+
+def _render_debug_block(result: dict[str, Any]) -> None:
+    """Render backend debug block."""
+
+    with st.expander(T.SECTION_DEBUG, expanded=False):
+        st.markdown(f"**{T.UPLOAD_USED_HEADER}**")
+        for name in result.get("uploaded_files", []):
+            st.caption(f"• {name}")
+
+        st.markdown(f"**{T.DEBUG_FRONTEND_UPLOAD_DIR}**")
+        st.code("\n".join(result.get("frontend_upload_paths", [])), language="text")
+
+        st.markdown(f"**{T.DEBUG_BACKEND_DATA_DIR}**")
+        st.code("\n".join(result.get("backend_data_paths", [])), language="text")
+
+        st.markdown(f"**{T.DEBUG_BACKEND_OUTPUT_DIR}**")
+        st.code(str(result.get("backend_output_path", "")), language="text")
+
+        st.markdown(f"**{T.DEBUG_BACKEND_COMMAND}**")
+        st.code(result.get("backend_command", ""), language="bash")
+
+        st.markdown(f"**{T.DEBUG_BACKEND_LOG}**")
+        st.code(result.get("backend_log", ""), language="text")
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -684,6 +926,9 @@ if "upload_key_nonce" not in st.session_state:
 if "current_workpaper_metadata" not in st.session_state:
     st.session_state.current_workpaper_metadata = {}
 
+if "history_owner_id" not in st.session_state:
+    st.session_state.history_owner_id = uuid.uuid4().hex
+
 
 # ── Top navigation ────────────────────────────────────────────────────────────
 nav_col_1, nav_col_2 = st.columns(2)
@@ -721,7 +966,7 @@ with left:
             unsafe_allow_html=True,
         )
 
-        previous_files = _list_previous_workpapers()
+        previous_files = _list_previous_workpapers(st.session_state.history_owner_id)
 
         if not previous_files:
             st.info("No previous workpapers found in frontend/downloads/ yet.")
@@ -808,7 +1053,133 @@ with left:
             help="This will be passed to the backend so itr_rules / ato_policy can switch rule sets.",
         )
 
-        requested_tables: dict[str, bool] = {}
+        selected_table_keys = st.multiselect(
+            "Optional review schedules",
+            options=list(OPTIONAL_TABLES),
+            format_func=lambda key: OPTIONAL_TABLES[key],
+            help="Only selected schedules will be added to the workbook.",
+        )
+        requested_tables = {
+            key: key in selected_table_keys
+            for key in OPTIONAL_TABLES
+        }
+
+        assess_base_rate = st.checkbox(
+            "Assess eligibility for the 25% base-rate-entity tax rate",
+            value=False,
+            help=(
+                "The system checks the two numerical thresholds. An accountant "
+                "must still confirm aggregation and passive-income classification."
+            ),
+        )
+
+        base_rate_entity_assessment: dict[str, Any] = {}
+        base_rate_available = False
+
+        if assess_base_rate:
+            st.caption(
+                "Enter income-year figures. Aggregated turnover must include relevant "
+                "connected and affiliated entities."
+            )
+            bre_col_1, bre_col_2, bre_col_3 = st.columns(3)
+            with bre_col_1:
+                aggregated_turnover = st.number_input(
+                    "Aggregated turnover ($)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=1000.0,
+                    format="%.2f",
+                )
+            with bre_col_2:
+                total_assessable_income = st.number_input(
+                    "Total assessable income ($)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=1000.0,
+                    format="%.2f",
+                )
+            with bre_col_3:
+                passive_income = st.number_input(
+                    "Base-rate passive income ($)",
+                    min_value=0.0,
+                    value=0.0,
+                    step=1000.0,
+                    format="%.2f",
+                )
+
+            figures_ready = total_assessable_income > 0
+            reviewer_confirmed_base_rate = False
+            try:
+                preliminary_assessment = build_base_rate_entity_assessment(
+                    ato_policy_year,
+                    aggregated_turnover=str(aggregated_turnover),
+                    total_assessable_income=str(total_assessable_income),
+                    base_rate_entity_passive_income=str(passive_income),
+                )
+                passive_percentage = float(
+                    preliminary_assessment["passive_income_ratio"]
+                )
+                turnover_result = (
+                    "Pass" if preliminary_assessment["turnover_below_threshold"] else "Fail"
+                )
+                passive_result = (
+                    "Pass"
+                    if preliminary_assessment["passive_income_ratio_within_limit"]
+                    else "Fail"
+                )
+                st.caption(
+                    f"Turnover test: {turnover_result} · Passive-income test: "
+                    f"{passive_result} ({passive_percentage:.2%})"
+                )
+
+                numeric_tests_pass = bool(
+                    figures_ready
+                    and preliminary_assessment["eligible_on_supplied_figures"]
+                )
+                reviewer_confirmed_base_rate = st.checkbox(
+                    "I confirm the figures include the required connected/affiliated "
+                    "entities and the passive-income classification has been reviewed.",
+                    value=False,
+                    disabled=not numeric_tests_pass,
+                )
+                base_rate_entity_assessment = build_base_rate_entity_assessment(
+                    ato_policy_year,
+                    aggregated_turnover=str(aggregated_turnover),
+                    total_assessable_income=str(total_assessable_income),
+                    base_rate_entity_passive_income=str(passive_income),
+                    reviewer_confirmed=reviewer_confirmed_base_rate,
+                )
+                base_rate_available = bool(
+                    numeric_tests_pass and reviewer_confirmed_base_rate
+                )
+                if not figures_ready:
+                    st.info("Enter total assessable income to complete the assessment.")
+                elif not preliminary_assessment["eligible_on_supplied_figures"]:
+                    st.warning("The supplied figures do not qualify for the 25% rate.")
+                elif base_rate_available:
+                    st.success("The 25% rate is available for selection on the supplied facts.")
+            except ValueError as exc:
+                st.error(f"Base-rate-entity assessment could not be completed: {exc}")
+
+        tax_rate_options = ["review_required", "general"]
+        if base_rate_available:
+            tax_rate_options.insert(1, "base_rate_entity")
+
+        tax_rate_choice = st.selectbox(
+            "Company tax rate",
+            options=tax_rate_options,
+            format_func=lambda value: {
+                "review_required": "Not confirmed — do not calculate tax payable",
+                "base_rate_entity": "25% — confirmed base rate entity",
+                "general": "30% — other company",
+            }[value],
+            help=(
+                "The 25% option is locked until the numerical assessment passes and "
+                "the reviewer confirmation is selected."
+            ),
+        )
+        if not base_rate_available:
+            st.caption("25% is locked until the base-rate-entity assessment is completed.")
 
         reviewer_notes = st.text_area(
             "Reviewer instructions / special facts",
@@ -826,26 +1197,25 @@ with left:
             height=90,
         )
 
-        # ── Admin ────────────────────────────────────────────────────────────
+        # ── AI API input ─────────────────────────────────────────────────────
         ai_provider = "None"
         ai_model = ""
         api_key = ""
         run_ai_face_check = False
 
-        with st.expander(T.ADMIN_HEADER, expanded=False):
+        with st.expander("AI API input", expanded=True):
             st.markdown(
-                f"""
+                """
                 <div class="admin-section">
-                    <div class="admin-label">Admin only</div>
+                    <div class="admin-label">AI API input</div>
                     <p style="font-size:0.85rem;color:#6b5c3a;margin-top:0.5rem;">
-                        {T.ADMIN_WARNING}
+                        Optional. Gemini is used for rule explanations by reading
+                        <code>v1/itr_rules.py</code> and the selected year-specific rule file.
                     </p>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-
-            st.markdown('<div class="section-header">AI model setup</div>', unsafe_allow_html=True)
 
             ai_provider = st.selectbox(
                 "AI provider",
@@ -853,7 +1223,7 @@ with left:
                 index=0,
                 help=(
                     "Optional AI explanation / face-check after workbook generation. "
-                    "Gemini is currently the supported explanation path."
+                    "Gemini is currently the supported rule-explanation path."
                 ),
                 key="admin_ai_provider",
             )
@@ -878,12 +1248,6 @@ with left:
                     key="admin_ai_model",
                 )
 
-                if ai_provider != "Gemini":
-                    st.info(
-                        f"{ai_provider} UI is prepared, but the current rule-explanation path "
-                        "uses Gemini only."
-                    )
-
             run_ai_face_check = st.checkbox(
                 "Run AI face-check after workbook generation",
                 value=False,
@@ -903,9 +1267,6 @@ with left:
             st.session_state["AI_API_KEY"] = api_key
             st.session_state["AI_API_KEY_ENTERED"] = bool(api_key)
 
-            if st.button(T.ADMIN_BUTTON):
-                st.info(T.ADMIN_NOT_IMPL)
-
         # ── Generate ─────────────────────────────────────────────────────────
         st.markdown("")
 
@@ -920,16 +1281,9 @@ with left:
                 st.error(T.ERROR_NO_FILES)
 
             elif run_ai_face_check and ai_provider != "None" and not api_key:
-                st.error(f"Please enter a {ai_provider} API key in Admin, or turn off AI face-check.")
+                st.error(f"Please enter a {ai_provider} API key in AI API input, or turn off AI face-check.")
 
             else:
-                _apply_ai_environment(
-                    ai_provider=ai_provider,
-                    ai_model=ai_model,
-                    api_key=api_key,
-                    run_ai_face_check=run_ai_face_check,
-                )
-
                 with st.spinner(T.GENERATING_SPINNER_LABEL):
                     result = run_workpaper_job(
                         extra_files=uploaded_files,
@@ -940,6 +1294,12 @@ with left:
                         requested_tables=requested_tables,
                         reviewer_notes=reviewer_notes,
                         run_ai_face_check=run_ai_face_check,
+                        company_tax_rate_category=tax_rate_choice,
+                        base_rate_entity_assessment=base_rate_entity_assessment,
+                        history_owner_id=st.session_state.history_owner_id,
+                        ai_provider=ai_provider,
+                        ai_model=ai_model,
+                        ai_api_key=api_key,
                     )
 
                 _save_history_metadata(
@@ -955,6 +1315,9 @@ with left:
                     ai_provider=ai_provider,
                     ai_model=ai_model,
                     run_ai_face_check=run_ai_face_check,
+                    company_tax_rate_category=tax_rate_choice,
+                    base_rate_entity_assessment=base_rate_entity_assessment,
+                    requested_tables=requested_tables,
                 )
 
                 output_path = result.get("output_path")
@@ -1010,52 +1373,20 @@ with right:
 
                 st.markdown("<hr>", unsafe_allow_html=True)
 
-                st.markdown('<div class="section-header">Ask about previous workpaper</div>', unsafe_allow_html=True)
+                fake_result = {
+                    "output_name": selected_history_file.name,
+                    "output_path": str(selected_history_file),
+                    "detected": history_metadata.get("detected", {}),
+                    "warnings": history_metadata.get("warnings", []),
+                }
 
-                history_question = st.text_area(
-                    "Ask why the system labelled an account this way",
-                    placeholder=(
-                        "Example: Why did consulting income map to 6C? "
-                        "Why was depreciation added back? "
-                        "Why is this account marked Review?"
-                    ),
-                    height=110,
-                    key="history_revision_question",
-                    label_visibility="collapsed",
+                _render_rule_question_box(
+                    result=fake_result,
+                    metadata=history_metadata,
+                    text_area_key="history_revision_question",
+                    button_label="Ask about selected previous workpaper",
+                    button_key="ask_history_rule_explanation",
                 )
-
-                if st.button("Ask about selected previous workpaper", use_container_width=True):
-                    if not history_question.strip():
-                        st.warning("Please enter a question.")
-                    else:
-                        fake_result = {
-                            "output_name": selected_history_file.name,
-                            "output_path": str(selected_history_file),
-                            "detected": history_metadata.get("detected", {}),
-                            "warnings": history_metadata.get("warnings", []),
-                        }
-
-                        st.session_state.revision_response = _handle_revision_question(
-                            question=history_question,
-                            result=fake_result,
-                            metadata=history_metadata,
-                            policy_year=history_metadata.get("ato_policy_year", "2026"),
-                            ai_provider=st.session_state.get("AI_PROVIDER", "None"),
-                            ai_model=st.session_state.get("AI_MODEL", "gemini-2.5-flash"),
-                            api_key=st.session_state.get("AI_API_KEY", ""),
-                        )
-                        st.rerun()
-
-                if st.session_state.revision_response:
-                    st.markdown(
-                        """
-                        <div style="background:#f0f4ff;border:1px solid #c8d6f5;border-radius:6px;
-                                    padding:1rem 1.2rem;margin-top:0.8rem;font-size:0.88rem;">
-                        """,
-                        unsafe_allow_html=True,
-                    )
-                    st.markdown(st.session_state.revision_response)
-                    st.markdown("</div>", unsafe_allow_html=True)
 
             else:
                 st.warning("Selected history file no longer exists.")
@@ -1091,20 +1422,10 @@ with right:
             with st.expander("Error details", expanded=True):
                 st.code(result.get("error_message", "Unknown error"), language="text")
 
-            with st.expander(T.SECTION_DEBUG, expanded=False):
-                st.markdown(f"**{T.DEBUG_BACKEND_COMMAND}**")
-                st.code(result.get("backend_command", ""), language="bash")
-
-                st.markdown(f"**{T.DEBUG_FRONTEND_UPLOAD_DIR}**")
-                st.code("\n".join(result.get("frontend_upload_paths", [])), language="text")
-
-                st.markdown(f"**{T.DEBUG_BACKEND_DATA_DIR}**")
-                st.code("\n".join(result.get("backend_data_paths", [])), language="text")
-
-                st.markdown(f"**{T.DEBUG_BACKEND_LOG}**")
-                st.code(result.get("backend_log", ""), language="text")
+            _render_debug_block(result)
 
         else:
+            # 1. Result
             st.markdown(f'<div class="section-header">{T.SECTION_RESULT}</div>', unsafe_allow_html=True)
 
             st.markdown(
@@ -1144,227 +1465,26 @@ with right:
 
             st.markdown("<hr>", unsafe_allow_html=True)
 
-            # ── Custom ITR override ──────────────────────────────────────────
-            st.markdown('<div class="section-header">Custom ITR override</div>', unsafe_allow_html=True)
-
-            st.caption(
-                "Use this when a labelled account is wrong. "
-                "Generate the workpaper again to apply the change."
-            )
-
-            with st.expander("Add custom override", expanded=False):
-                report_type = st.selectbox(
-                    "Report type",
-                    ["profit_and_loss", "balance_sheet"],
-                    index=0,
-                    key="override_report_type",
-                )
-
-                match_type = st.selectbox(
-                    "Match type",
-                    ["contains", "exact", "regex"],
-                    index=0,
-                    key="override_match_type",
-                )
-
-                account_pattern = st.text_input(
-                    "Account pattern",
-                    placeholder="Example: bank fees / consulting income / depreciation",
-                    key="override_account_pattern",
-                )
-
-                section_pattern = st.text_input(
-                    "Optional section pattern",
-                    placeholder="Example: income / operating expenses / current assets",
-                    key="override_section_pattern",
-                )
-
-                override_name = st.text_input(
-                    "Override name",
-                    placeholder="Example: Bank fees to review",
-                    key="override_name",
-                )
-
-                col_a, col_b = st.columns(2)
-
-                with col_a:
-                    itr_ref = st.text_input(
-                        "New ITR Ref",
-                        placeholder="Example: Review / Inc - 6C / Exp - 6S",
-                        key="override_itr_ref",
-                    )
-
-                    treatment = st.selectbox(
-                        "Treatment",
-                        [
-                            "financial_label_only",
-                            "review_only",
-                            "support_only",
-                            "unmapped",
-                        ],
-                        index=1,
-                        key="override_treatment",
-                    )
-
-                with col_b:
-                    itr_label = st.text_input(
-                        "New ITR Label",
-                        placeholder="Example: User override - review bank fees",
-                        key="override_itr_label",
-                    )
-
-                    confidence = st.selectbox(
-                        "Confidence",
-                        ["high", "medium", "low"],
-                        index=0,
-                        key="override_confidence",
-                    )
-
-                review_note = st.text_area(
-                    "Review note",
-                    placeholder="Example: User override: force this account to review.",
-                    key="override_review_note",
-                )
-
-                override_reason = st.text_area(
-                    "Reason",
-                    placeholder="Example: Accountant reviewed this account and confirmed the base rule was not appropriate.",
-                    key="override_reason",
-                )
-
-                save_override_clicked = st.button(
-                    "Save custom override",
-                    use_container_width=True,
-                    key="save_custom_override",
-                )
-
-                if save_override_clicked:
-                    try:
-                        override = build_override_from_form(
-                            name=override_name,
-                            report_type=report_type,
-                            account_pattern=account_pattern,
-                            match_type=match_type,
-                            itr_ref=itr_ref,
-                            itr_label=itr_label,
-                            treatment=treatment,
-                            confidence=confidence,
-                            review_note=review_note,
-                            reason=override_reason,
-                            section_pattern=section_pattern,
-                        )
-
-                        append_override(override)
-
-                        st.success(
-                            "Custom override saved. Click Generate workpaper again to apply it."
-                        )
-
-                        st.json(override)
-
-                    except Exception as exc:
-                        st.error(f"Could not save override: {exc}")
-
-            with st.expander("Current custom overrides", expanded=False):
-                override_doc = load_override_doc()
-                st.json(override_doc)
+            # 2. Detected reports and backend warnings
+            _render_detected_and_warnings(result)
 
             st.markdown("<hr>", unsafe_allow_html=True)
 
-            col_det, col_warn = st.columns(2)
-
-            with col_det:
-                st.markdown(f"**{T.DETECTED_HEADER}**")
-                detected = result.get("detected", {})
-                if detected:
-                    for name, found in detected.items():
-                        badge_cls = "badge-green" if found else "badge-grey"
-                        icon = "✓" if found else "–"
-                        st.markdown(
-                            f'<span class="badge {badge_cls}">{icon} {name}</span>',
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    st.caption("No detection summary returned.")
-
-            with col_warn:
-                warnings = result.get("warnings", [])
-                st.markdown(f"**{T.WARNINGS_HEADER}**")
-
-                if warnings:
-                    for warning in warnings:
-                        st.markdown(
-                            f'<span class="badge badge-warning">⚠ {warning}</span>',
-                            unsafe_allow_html=True,
-                        )
-                else:
-                    st.markdown(
-                        f'<span class="badge badge-green">✓ {T.WARNINGS_NONE}</span>',
-                        unsafe_allow_html=True,
-                    )
-
-            with st.expander(T.SECTION_DEBUG, expanded=False):
-                st.markdown(f"**{T.UPLOAD_USED_HEADER}**")
-                for name in result.get("uploaded_files", []):
-                    st.caption(f"• {name}")
-
-                st.markdown(f"**{T.DEBUG_FRONTEND_UPLOAD_DIR}**")
-                st.code("\n".join(result.get("frontend_upload_paths", [])), language="text")
-
-                st.markdown(f"**{T.DEBUG_BACKEND_DATA_DIR}**")
-                st.code("\n".join(result.get("backend_data_paths", [])), language="text")
-
-                st.markdown(f"**{T.DEBUG_BACKEND_OUTPUT_DIR}**")
-                st.code(str(result.get("backend_output_path", "")), language="text")
-
-                st.markdown(f"**{T.DEBUG_BACKEND_COMMAND}**")
-                st.code(result.get("backend_command", ""), language="bash")
-
-                st.markdown(f"**{T.DEBUG_BACKEND_LOG}**")
-                st.code(result.get("backend_log", ""), language="text")
+            # 3. Ask why system labelled something
+            _render_rule_question_box(
+                result=result,
+                metadata=metadata,
+                text_area_key="current_revision_question",
+                button_label="Ask rule explanation",
+                button_key="ask_current_rule_explanation",
+            )
 
             st.markdown("<hr>", unsafe_allow_html=True)
 
-            # ── Revision / question box ──────────────────────────────────────
-            st.markdown('<div class="section-header">Ask why the system labelled something</div>', unsafe_allow_html=True)
+            # 4. Custom ITR override
+            _render_custom_override_box()
 
-            revision_text = st.text_area(
-                "Ask Gemini to explain the ITR label using itr_rules.py / itr_rules_2026.py",
-                placeholder=(
-                    "Example: Why did consulting income map to 6C? "
-                    "Why was depreciation added back? "
-                    "Why is this account marked Review?"
-                ),
-                help=(
-                    "If Gemini is configured in Admin, the app reads the relevant ITR rules file "
-                    "and asks Gemini to explain the rule logic. Otherwise it uses a simple fallback."
-                ),
-                height=110,
-                label_visibility="collapsed",
-            )
+            st.markdown("<hr>", unsafe_allow_html=True)
 
-            if st.button("Ask rule explanation", use_container_width=True):
-                if not revision_text.strip():
-                    st.warning("Please enter a question or revision request.")
-                else:
-                    st.session_state.revision_response = _handle_revision_question(
-                        question=revision_text,
-                        result=result,
-                        metadata=metadata,
-                        policy_year=metadata.get("ato_policy_year", "2026"),
-                        ai_provider=st.session_state.get("AI_PROVIDER", "None"),
-                        ai_model=st.session_state.get("AI_MODEL", "gemini-2.5-flash"),
-                        api_key=st.session_state.get("AI_API_KEY", ""),
-                    )
-                    st.rerun()
-
-            if st.session_state.revision_response:
-                st.markdown(
-                    """
-                    <div style="background:#f0f4ff;border:1px solid #c8d6f5;border-radius:6px;
-                                padding:1rem 1.2rem;margin-top:0.8rem;font-size:0.88rem;">
-                    """,
-                    unsafe_allow_html=True,
-                )
-                st.markdown(st.session_state.revision_response)
-                st.markdown("</div>", unsafe_allow_html=True)
+            # Optional debug after the main workflow
+            _render_debug_block(result)

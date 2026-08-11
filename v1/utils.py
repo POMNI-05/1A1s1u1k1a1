@@ -5,7 +5,10 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
-from config import DATA_DIR, INPUT_DIR, PROCESSED_DIR, LOG_DIR, OUTPUT_DIR
+try:
+    from .config import DATA_DIR, INPUT_DIR, PROCESSED_DIR, LOG_DIR, OUTPUT_DIR
+except ImportError:  # Direct-script compatibility.
+    from config import DATA_DIR, INPUT_DIR, PROCESSED_DIR, LOG_DIR, OUTPUT_DIR
 
 
 def ensure_dirs() -> None:

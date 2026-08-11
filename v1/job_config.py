@@ -26,6 +26,9 @@ DEFAULT_JOB_CONFIG = {
     "company_profile": "",
     "document_description": "",
     "client_name": "",
+    "company_tax_rate_category": "review_required",
+    "base_rate_entity_assessment": {},
+    "retain_job_files": False,
 }
 
 
@@ -74,3 +77,8 @@ def get_policy_year(default: str = "2026") -> str:
 def table_requested(table_key: str) -> bool:
     config = load_job_config()
     return bool((config.get("requested_tables") or {}).get(table_key, False))
+
+
+def get_tax_rate_category(default: str = "review_required") -> str:
+    value = str(load_job_config().get("company_tax_rate_category", default)).strip().lower()
+    return value if value in {"base_rate_entity", "general"} else default

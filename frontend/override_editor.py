@@ -15,6 +15,9 @@ Important:
 from __future__ import annotations
 
 import json
+import os
+import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,7 @@ ROOT_DIR = FRONTEND_DIR.parent
 V1_DIR = ROOT_DIR / "v1"
 
 OVERRIDE_FILE = V1_DIR / "user_itr_overrides.json"
+_OVERRIDE_LOCK = threading.RLock()
 
 
 DEFAULT_OVERRIDE_DOC = {
@@ -73,9 +77,16 @@ def load_override_doc(path: Path = OVERRIDE_FILE) -> dict[str, Any]:
 
 def save_override_doc(data: dict[str, Any], path: Path = OVERRIDE_FILE) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def validate_override(override: dict[str, Any]) -> list[str]:
@@ -158,8 +169,9 @@ def append_override(override: dict[str, Any], path: Path = OVERRIDE_FILE) -> dic
     if errors:
         raise ValueError("; ".join(errors))
 
-    data = load_override_doc(path)
-    data["overrides"].append(override)
-    save_override_doc(data, path)
+    with _OVERRIDE_LOCK:
+        data = load_override_doc(path)
+        data["overrides"].append(override)
+        save_override_doc(data, path)
 
     return data

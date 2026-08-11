@@ -36,6 +36,7 @@ try:
         REPORT_TYPE_PL,
         REPORT_TYPE_TAX_DEPRECIATION,
         REPORT_TYPE_UNKNOWN,
+        SELECTED_INCOME_YEAR,
         TAX_DEPRECIATION_PATH,
         TAX_DEPRECIATION_SHEET_NAME,
     )
@@ -51,6 +52,7 @@ except ImportError:  # Direct-script compatibility.
     REPORT_TYPE_PL,
     REPORT_TYPE_TAX_DEPRECIATION,
     REPORT_TYPE_UNKNOWN,
+    SELECTED_INCOME_YEAR,
     TAX_DEPRECIATION_PATH,
     TAX_DEPRECIATION_SHEET_NAME,
     )
@@ -212,6 +214,38 @@ def clean_amount(value) -> float:
         return 0.0
 
     return -number if negative else number
+
+
+def _invalid_amount_value(value) -> bool:
+    """Return True for explicit Excel errors; blanks remain valid blanks."""
+    if pd.isna(value):
+        return False
+    return bool(
+        re.search(
+            r"#(?:REF!|VALUE!|DIV/0!|NAME\?|N/A|NUM!|NULL!)",
+            str(value),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+def _has_unsafe_side_by_side_tables(raw_df: pd.DataFrame) -> bool:
+    """Detect the known unsafe tax-disclosure + client-TB composite layout."""
+    preview = " | ".join(
+        normalise_match_text(value)
+        for value in raw_df.head(20).to_numpy().ravel()
+        if not pd.isna(value)
+    )
+    has_tax_disclosure = "tax return disclosures" in preview
+    has_client_tb = any(
+        marker in preview
+        for marker in (
+            "source data from client trial balance",
+            "from client tb",
+            "client trial balance",
+        )
+    )
+    return has_tax_disclosure and has_client_tb
 
 
 def normalise_text(value) -> str:
@@ -562,7 +596,7 @@ def find_data_start_row_in_df(raw_df: pd.DataFrame, scan_rows: int = 80) -> int:
         values = [normalise_match_text(x) for x in row.tolist()]
         score = 0
 
-        if any(v in {"account", "description", "account name"} for v in values):
+        if any(v in {"account", "description", "account name", "name"} for v in values):
             score += 6
 
         if any(re.search(r"20\d{2}|30 june|30 jun|year", v) for v in values):
@@ -592,7 +626,7 @@ def find_data_start_row(
 
 def detect_account_col(df: pd.DataFrame) -> str:
     for col in df.columns:
-        if normalise_match_text(col) in {"account", "description", "account name"}:
+        if normalise_match_text(col) in {"account", "description", "account name", "name"}:
             return col
 
     best = df.columns[0]
@@ -625,8 +659,13 @@ def detect_amount_cols(df: pd.DataFrame, account_col: str | None = None) -> list
 
         cleaned = df[col].apply(clean_amount)
         raw_has_digits = df[col].astype(str).str.contains(r"\d", na=False, regex=True)
+        raw_has_errors = df[col].apply(_invalid_amount_value)
 
-        if raw_has_digits.sum() >= max(2, len(df) * 0.12) or (cleaned != 0).sum() >= 1:
+        if (
+            raw_has_digits.sum() >= max(2, len(df) * 0.12)
+            or (cleaned != 0).sum() >= 1
+            or raw_has_errors.any()
+        ):
             amount_cols.append(col)
 
     return amount_cols
@@ -636,13 +675,31 @@ def choose_current_amount_col(df: pd.DataFrame, amount_cols: list[str]) -> str:
     if not amount_cols:
         raise ValueError("No amount columns detected in report.")
 
+    requested_year_matches = []
+
     for col in amount_cols:
         lower = normalise_match_text(col)
 
-        if re.search(r"20\d{2}|30 june|30 jun", lower) and "variance" not in lower:
-            return col
+        if str(SELECTED_INCOME_YEAR) in lower and "variance" not in lower:
+            requested_year_matches.append(col)
 
-    return amount_cols[0]
+    if len(requested_year_matches) == 1:
+        return requested_year_matches[0]
+
+    if len(requested_year_matches) > 1:
+        raise ValueError(
+            f"PERIOD-001: income year {SELECTED_INCOME_YEAR} matches multiple amount columns: "
+            f"{requested_year_matches}"
+        )
+
+    # A one-period report can legitimately use a generic amount header.
+    if len(amount_cols) == 1:
+        return amount_cols[0]
+
+    raise ValueError(
+        f"PERIOD-001: income year {SELECTED_INCOME_YEAR} is not uniquely present in report columns: "
+        f"{amount_cols}"
+    )
 
 
 def detect_report_structure(df: pd.DataFrame) -> ReportStructure:
@@ -758,6 +815,11 @@ def add_row_type(df: pd.DataFrame, account_col: str, amount_cols: list[str]) -> 
         if text in total_exact or text.startswith("total "):
             return "total"
 
+        # A populated monetary row is an account even when its name also looks
+        # like a section heading (for example Sales or Other Income).
+        if has_amount(row):
+            return "account"
+
         if text in heading_names:
             return "heading"
 
@@ -813,11 +875,27 @@ def clean_report_input(report_input: ReportInput) -> pd.DataFrame:
         report_input.sheet_name,
     )
 
+    if _has_unsafe_side_by_side_tables(report_input.raw_df):
+        raise ValueError(
+            "STRUCT-003: tax-disclosure and client trial-balance tables are "
+            "side by side and cannot be safely paired"
+        )
+
     start_row = find_data_start_row_in_df(report_input.raw_df)
     df = _table_from_raw_df(report_input.raw_df, start_row)
 
     structure = detect_report_structure(df)
     account_col = structure.account_col
+
+    invalid_cells = []
+    for col in structure.amount_cols:
+        for row_index, value in df[col].items():
+            if _invalid_amount_value(value):
+                invalid_cells.append(f"{col} row {int(row_index) + start_row + 2}: {value}")
+
+    if invalid_cells:
+        sample = "; ".join(invalid_cells[:5])
+        raise ValueError(f"CELL-001: invalid Excel amount value(s): {sample}")
 
     df[account_col] = standardise_account_names(df[account_col])
 
@@ -907,9 +985,14 @@ def _clean_support_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
 
-    structure = detect_report_structure(df)
+    # Support schedules may have several numeric columns (cost, depreciation,
+    # closing value) but no report-period header.  Their selected deduction is
+    # resolved explicitly by extract_tax_depreciation_total(), so do not apply
+    # the P&L/BS requested-period selector here.
+    account_col = detect_account_col(df)
+    amount_cols = detect_amount_cols(df, account_col)
 
-    for col in structure.amount_cols:
+    for col in amount_cols:
         df[col] = df[col].apply(clean_amount)
 
     return df
@@ -927,28 +1010,46 @@ def extract_tax_depreciation_total(report_input: ReportInput) -> float | None:
     if not amount_cols:
         return None
 
-    names = df[account_col].astype(str).str.lower().str.strip()
-
-    for alias in TAX_DEPRECIATION_TOTAL_ALIASES:
-        matched = df[names.str.contains(re.escape(alias), na=False, regex=True)]
-
-        if not matched.empty:
-            amount_col = choose_current_amount_col(df, amount_cols)
-            return clean_amount(matched.iloc[-1][amount_col])
+    names = df[account_col].astype(str).map(normalise_match_text)
+    total_rows = df[
+        names.eq("total")
+        | names.eq("total depreciation")
+        | names.eq("total tax depreciation")
+        | names.eq("total decline in value")
+        | names.eq("depreciation deduction")
+    ]
 
     depreciation_cols = [
         col for col in amount_cols
         if re.search(
-            r"depreciation|decline|deduction|30 jun|30 june|20\d{2}",
+            r"depreciation|decline in value|tax deduction",
             normalise_match_text(col),
         )
     ]
 
-    if depreciation_cols:
-        col = depreciation_cols[0]
-        return float(df[col].apply(clean_amount).sum())
+    if total_rows.empty or not depreciation_cols:
+        logger.warning(
+            "DEPR-002: explicit depreciation total/column not found in %s :: %s",
+            report_input.source_path,
+            report_input.sheet_name,
+        )
+        return None
 
-    return None
+    year_cols = [
+        col for col in depreciation_cols
+        if str(SELECTED_INCOME_YEAR) in normalise_match_text(col)
+    ]
+    if len(year_cols) > 1:
+        logger.warning("DEPR-001: multiple requested-year depreciation columns: %s", year_cols)
+        return None
+
+    amount_col = year_cols[0] if year_cols else depreciation_cols[0]
+    value = total_rows.iloc[-1][amount_col]
+
+    if _invalid_amount_value(value):
+        raise ValueError(f"CELL-001: invalid tax depreciation total: {value}")
+
+    return clean_amount(value)
 
 
 def load_clean_report_bundle() -> CleanedReports:

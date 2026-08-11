@@ -1,23 +1,5 @@
 {
   "version": 1,
   "description": "User/custom ITR labelling overrides. These are applied after base itr_rules matching and before workbook output.",
-  "overrides": [
-    {
-      "enabled": true,
-      "name": "Test override - force bank fees to review",
-      "report_type": "profit_and_loss",
-      "match_type": "contains",
-      "account_pattern": "bank fees",
-      "section_pattern": "",
-      "reason": "Testing override layer.",
-      "set": {
-        "ITR Ref": "Review",
-        "ITR Label": "User override test - review bank fees",
-        "Treatment": "review_only",
-        "Confidence": "high",
-        "Review Note": "User override test: bank fees forced to review.",
-        "Label Reason": "User override applied after base ITR rule matching."
-      }
-    }
-  ]
+  "overrides": []
 }

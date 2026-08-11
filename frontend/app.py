@@ -36,6 +36,9 @@ ROOT_DIR = FRONTEND_DIR.parent
 V1_DIR = ROOT_DIR / "v1"
 DOWNLOADS_DIR = FRONTEND_DIR / "downloads"
 
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
 if str(FRONTEND_DIR) not in sys.path:
     sys.path.insert(0, str(FRONTEND_DIR))
 
@@ -82,14 +85,16 @@ RULE_CONTEXT_MAX_CHARS = 45_000
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _list_previous_workpapers(history_owner_id: str) -> list[Path]:
-    """Return workpapers owned by the current Streamlit session."""
-    owner_dir = DOWNLOADS_DIR / history_owner_id
-    if not owner_dir.exists():
-        return []
-
+    """Return session workpapers plus explicitly generated local batch runs."""
+    history_dirs = {
+        DOWNLOADS_DIR / history_owner_id,
+        DOWNLOADS_DIR / "local-batch",
+    }
     files = [
         path
-        for path in owner_dir.glob("*.xlsx")
+        for history_dir in history_dirs
+        if history_dir.exists()
+        for path in history_dir.glob("*.xlsx")
         if path.is_file() and not path.name.startswith("~$")
     ]
 
@@ -803,10 +808,8 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-    @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
-
     html, body, [class*="css"] {
-        font-family: 'IBM Plex Sans', sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
 
     .block-container {
@@ -839,7 +842,7 @@ st.markdown(
         color: #999;
         margin-top: 0.1rem;
         margin-bottom: 1.5rem;
-        font-family: 'IBM Plex Mono', monospace;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
     }
 
     .result-card {

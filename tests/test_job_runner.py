@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import subprocess
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -9,6 +11,47 @@ from frontend import job_runner
 
 
 class JobRunnerTests(unittest.TestCase):
+    def test_backend_timeout_is_bounded_and_has_safe_default(self):
+        with patch.dict(
+            "os.environ",
+            {"TAX_BACKEND_TIMEOUT_SECONDS": "not-a-number"},
+            clear=False,
+        ):
+            self.assertEqual(
+                job_runner._backend_timeout_seconds(),
+                job_runner.DEFAULT_BACKEND_TIMEOUT_SECONDS,
+            )
+
+        with patch.dict(
+            "os.environ",
+            {"TAX_BACKEND_TIMEOUT_SECONDS": "1"},
+            clear=False,
+        ):
+            self.assertEqual(
+                job_runner._backend_timeout_seconds(),
+                job_runner.MIN_BACKEND_TIMEOUT_SECONDS,
+            )
+
+    def test_backend_timeout_returns_error_and_cleans_job(self):
+        upload = io.BytesIO(b"not needed by mocked backend")
+        upload.name = "input.xlsx"
+
+        with TemporaryDirectory() as folder:
+            jobs_dir = Path(folder) / "jobs"
+            with (
+                patch.object(job_runner, "JOBS_DIR", jobs_dir),
+                patch.object(
+                    job_runner,
+                    "_run_v1_main",
+                    side_effect=subprocess.TimeoutExpired("v1.main", 30),
+                ),
+            ):
+                result = job_runner.run_workpaper_job(extra_files=[upload])
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("timed out after 30 seconds", result["error_message"])
+        self.assertTrue(result["job_cleaned_up"])
+
     def test_all_supported_policy_years_are_preserved(self):
         for year in ("2024", "2025", "2026"):
             with self.subTest(year=year):

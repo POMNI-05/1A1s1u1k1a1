@@ -1,3 +1,3 @@
 #!/bin/bash
 cd /Users/icgtaxinternai/Documents/Code/tax_return_auto
-python -m streamlit run frontend/app.py
+python -m streamlit run frontend/app.py --server.fileWatcherType=none --browser.gatherUsageStats=false

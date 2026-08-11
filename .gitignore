@@ -1,6 +1,7 @@
 # Environment & secrets
 .env
 interesting_spots.md
+.ruff_cache/
 
 # Raw downloaded data and outputs (financial data — never commit)
 v1/data/

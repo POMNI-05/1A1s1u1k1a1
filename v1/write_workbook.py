@@ -1,14 +1,15 @@
 # v1/write_workbook.py
-"""Write the final Excel workbook while preserving raw report evidence values.
+"""Write a reviewer-friendly Excel workpaper from validated report inputs.
 
 This writer is input-source flexible:
 - P&L and BS may come from separate workbooks;
 - or from different sheets in one combined workbook.
 
-Note:
-- This version preserves raw values, not original Excel styling/formulas.
-- If exact source styling/formulas must be preserved, use source_path + sheet_name
-  metadata from cleaner.ReportInput and copy with openpyxl from the original sheet.
+Output rule:
+- source P&L and Balance Sheet evidence stays on its own sheet;
+- generated review columns are appended outside the copied source range;
+- Tax Reconciliation contains only the reconciliation, not duplicated source reports;
+- period columns come from validated data and are never padded to a fixed year count.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ try:
     from .cleaner import ReportInput
     from .config import (
         OUTPUT_PATH,
+        SELECTED_INCOME_YEAR,
         SHEET_BS_RAW,
         SHEET_PL_RAW,
         SHEET_RECONCILIATION,
@@ -36,6 +38,7 @@ except ImportError:  # Direct-script compatibility.
     from cleaner import ReportInput
     from config import (
         OUTPUT_PATH,
+        SELECTED_INCOME_YEAR,
         SHEET_BS_RAW,
         SHEET_PL_RAW,
         SHEET_RECONCILIATION,
@@ -210,21 +213,17 @@ def _looks_like_generated_column(src_ws, col_idx: int) -> bool:
             continue
         values.append(str(value).strip().lower())
 
-    joined = " | ".join(values)
-
     generated_markers = [
         "itr label",
         "itr ref",
         "itr totals",
         "review note",
         "tax reconciliation",
-        "total income",
-        "total expenses",
-        "pre tax profit",
-        "pre tax profit/(loss)",
     ]
 
-    return any(marker in joined for marker in generated_markers)
+    # Only confirmed header values identify generated columns. Genuine account
+    # columns naturally contain Total Income / Total Expenses / Net Profit.
+    return any(value in generated_markers for value in values[:10])
 
 def _copy_sheet_to_workbook(report_input: ReportInput, dst_wb: Workbook, title: str):
     """
@@ -336,13 +335,32 @@ def _write_side_labels(
     labelled_df: pd.DataFrame,
     source_start_row: int,
     itr_col: int,
+    confidence_col: int,
+    reason_col: int,
     review_col: int,
     report_type: str = "",
 ) -> None:
-    ws.cell(source_start_row, itr_col, "ITR Label")
-    ws.cell(source_start_row, review_col, "Review note")
+    source_rows = []
+    if labelled_df is not None and not labelled_df.empty and "Source Row" in labelled_df:
+        source_rows = [
+            int(value)
+            for value in labelled_df["Source Row"].dropna().tolist()
+            if int(value) >= source_start_row
+        ]
 
-    for cell in (ws.cell(source_start_row, itr_col), ws.cell(source_start_row, review_col)):
+    header_row = max(source_start_row, min(source_rows) - 1) if source_rows else source_start_row
+    headers = {
+        itr_col: "ITR Label",
+        confidence_col: "Confidence",
+        reason_col: "Mapping reason",
+        review_col: "Review note",
+    }
+
+    for col_idx, header in headers.items():
+        ws.cell(header_row, col_idx, header)
+
+    for col_idx in headers:
+        cell = ws.cell(header_row, col_idx)
         cell.font = RED_FONT
         cell.fill = HEADER_FILL
         cell.alignment = Alignment(horizontal="center", vertical="top", wrap_text=False)
@@ -371,21 +389,22 @@ def _write_side_labels(
         excel_row = source_start_row + int(source_row) - 1
 
         visible_note = review_note
-        if label_reason and confidence in {"medium", "low"}:
-            visible_note = f"{review_note} {label_reason}".strip()
 
         label_cell = ws.cell(excel_row, itr_col, itr_ref)
+        confidence_cell = ws.cell(excel_row, confidence_col, confidence or None)
+        reason_cell = ws.cell(excel_row, reason_col, label_reason or None)
         note_cell = ws.cell(excel_row, review_col, visible_note)
 
         label_cell.font = RED_FONT if itr_ref else REVIEW_NOTE_FONT
         label_cell.alignment = Alignment(vertical="top", wrap_text=False)
 
-        note_cell.font = REVIEW_NOTE_FONT
-        note_cell.alignment = Alignment(vertical="top", wrap_text=False)
+        for cell in (confidence_cell, reason_cell, note_cell):
+            cell.font = REVIEW_NOTE_FONT
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
 
         if should_highlight_mapping(row.to_dict(), report_type=report_type):
-            label_cell.fill = REVIEW_FILL
-            note_cell.fill = REVIEW_FILL
+            for cell in (label_cell, confidence_cell, reason_cell, note_cell):
+                cell.fill = REVIEW_FILL
 
 def _write_tax_reconciliation_table(
     ws,
@@ -405,9 +424,19 @@ def _write_tax_reconciliation_table(
 
     header_row = start_row + 1
 
+    period_cols = [
+        col for col in display_cols if col not in {"Description", "ITR Ref", "Review note"}
+    ]
+
     for idx, col_name in enumerate(display_cols):
-        cell = ws.cell(header_row, start_col + idx, col_name)
-        cell.fill = HEADER_FILL
+        display_name = col_name
+        if col_name in period_cols:
+            year_match = re.search(r"\b(20\d{2})\b", str(col_name))
+            if year_match:
+                display_name = f"Year Ended 30 June {year_match.group(1)}"
+
+        cell = ws.cell(header_row, start_col + idx, display_name)
+        cell.fill = TITLE_FILL if str(SELECTED_INCOME_YEAR) in str(col_name) else HEADER_FILL
         cell.font = HEADER_FONT
         cell.alignment = Alignment(horizontal="center", wrap_text=False)
 
@@ -417,13 +446,23 @@ def _write_tax_reconciliation_table(
         for c_idx, col_name in enumerate(display_cols):
             value = _safe(row[col_name])
             cell = ws.cell(r_idx, start_col + c_idx, value)
-            cell.alignment = Alignment(vertical="top", wrap_text=False)
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=str(col_name).strip().lower() in {"detail", "review note", "reason"},
+            )
 
             if _is_number(value):
                 cell.number_format = '$#,##0.00;($#,##0.00);-'
 
             if col_name == "ITR Ref" and str(value or "").strip():
                 cell.font = RED_FONT
+
+            if col_name in period_cols:
+                cell.fill = (
+                    TITLE_FILL
+                    if str(SELECTED_INCOME_YEAR) in str(col_name)
+                    else HEADER_FILL
+                )
 
         if line_type == "heading":
             for c in range(start_col, last_col + 1):
@@ -458,7 +497,7 @@ def _write_tax_reconciliation_table(
         elif header == "Review note":
             ws.column_dimensions[letter].width = 32
         elif re.search(r"20\d{2}|30 June|30 Jun", header):
-            ws.column_dimensions[letter].width = 14
+            ws.column_dimensions[letter].width = 22
         else:
             ws.column_dimensions[letter].width = 12
 
@@ -504,23 +543,41 @@ def _find_main_amount_col(ws, start_row: int, last_row: int, last_col: int) -> i
 
     Usually this is column B, but this is safer than hard-coding B.
     """
-    best_col = 2
-    best_count = -1
+    year_matches = []
 
     for col_idx in range(1, last_col + 1):
-        count = 0
+        for row_idx in range(start_row, min(last_row, start_row + 12) + 1):
+            value = ws.cell(row_idx, col_idx).value
+            if value is not None and str(SELECTED_INCOME_YEAR) in str(value):
+                year_matches.append(col_idx)
+                break
 
+    year_matches = list(dict.fromkeys(year_matches))
+    if len(year_matches) == 1:
+        return year_matches[0]
+    if len(year_matches) > 1:
+        raise ValueError(
+            f"PERIOD-001: income year {SELECTED_INCOME_YEAR} appears in multiple report columns: "
+            f"{year_matches}"
+        )
+
+    # A generic one-period export may omit a year header.  It is safe only
+    # when exactly one numeric candidate exists; otherwise do not guess.
+    numeric_cols = []
+    for col_idx in range(1, last_col + 1):
         for row_idx in range(start_row, last_row + 1):
             value = ws.cell(row_idx, col_idx).value
-
             if _is_number(value):
-                count += 1
+                numeric_cols.append(col_idx)
+                break
 
-        if count > best_count:
-            best_count = count
-            best_col = col_idx
+    if len(numeric_cols) == 1:
+        return numeric_cols[0]
 
-    return best_col
+    raise ValueError(
+        f"PERIOD-001: income year {SELECTED_INCOME_YEAR} is not uniquely present in report columns; "
+        f"numeric candidates={numeric_cols}"
+    )
 
 
 def _write_pl_formula_summary_table(
@@ -752,8 +809,12 @@ def _write_simple_table(
         letter = get_column_letter(c_idx)
         lower = str(col_name).strip().lower()
 
-        if lower in {"review note", "reason", "label reason"}:
+        if lower in {"review note", "reason", "label reason", "detail"}:
             ws.column_dimensions[letter].width = 38
+        elif lower == "check":
+            ws.column_dimensions[letter].width = 32
+        elif lower == "status":
+            ws.column_dimensions[letter].width = 26
         elif lower in {"description", "account", "workpaper label", "itr label"}:
             ws.column_dimensions[letter].width = 30
         elif lower == "source rows":
@@ -791,193 +852,154 @@ def _format_sheet(ws, raw_block_last_col: int) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = 22
 
 
+def _append_review_output(
+    ws,
+    labelled_df: pd.DataFrame,
+    label_summary: pd.DataFrame,
+    report_type: str,
+) -> None:
+    """Append generated review fields without changing the copied source range."""
+    source_last_col = ws.max_column
+    itr_col = source_last_col + 2
+    confidence_col = itr_col + 1
+    reason_col = itr_col + 2
+    review_col = itr_col + 3
+
+    widths = {itr_col: 14, confidence_col: 12, reason_col: 38, review_col: 42}
+    for col_idx, width in widths.items():
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    _write_side_labels(
+        ws,
+        labelled_df,
+        1,
+        itr_col,
+        confidence_col,
+        reason_col,
+        review_col,
+        report_type=report_type,
+    )
+
+    summary_col = review_col + 2
+    if report_type == "profit_and_loss":
+        amount_col = _find_main_amount_col(ws, 1, ws.max_row, source_last_col)
+        _write_pl_formula_summary_table(
+            ws,
+            title="ITR Totals",
+            start_row=1,
+            start_col=summary_col,
+            label_col=itr_col,
+            amount_col=amount_col,
+            data_start_row=1,
+            data_last_row=ws.max_row,
+        )
+    else:
+        _write_label_summary_table(
+            ws,
+            label_summary,
+            "Balance Sheet ITR Summary",
+            1,
+            summary_col,
+        )
+
+    ws.freeze_panes = ws.freeze_panes or "A2"
+
+
+def _write_inputs_sheet(wb: Workbook, workpaper) -> None:
+    tables: list[tuple[str, pd.DataFrame, bool]] = []
+
+    if workpaper.carry_forward_losses is not None and not workpaper.carry_forward_losses.empty:
+        tables.append(("Carry Forward Losses", workpaper.carry_forward_losses, True))
+    if workpaper.rd_breakdown is not None and not workpaper.rd_breakdown.empty:
+        tables.append(("R&D Breakdown", workpaper.rd_breakdown, True))
+
+    for title, table in getattr(workpaper, "support_tables", {}).items():
+        if table is not None and not table.empty:
+            tables.append((title, table, True))
+
+    proposed = getattr(workpaper, "proposed_adjustments", None)
+    if proposed is not None and not proposed.empty:
+        tables.append(("Proposed Tax Adjustments - Not Posted Unless Approved", proposed, False))
+
+    if not tables:
+        return
+
+    ws = wb.create_sheet("Inputs & Overrides")
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A2"
+    row = 1
+    for title, table, is_input in tables:
+        row, _ = _write_simple_table(ws, table, title, row, 1, input_table=is_input)
+        row += 3
+
+
+def _write_checks_sheet(wb: Workbook, reports, workpaper) -> None:
+    ws = wb.create_sheet("Checks")
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A2"
+
+    periods = [
+        col
+        for col in workpaper.tax_reconciliation.columns
+        if col not in {"Line Type", "Description", "ITR Ref", "Review note"}
+    ]
+    output_checks = pd.DataFrame(
+        [
+            {"Check": "Requested income year", "Status": "OK", "Detail": str(SELECTED_INCOME_YEAR)},
+            {
+                "Check": "Rendered reconciliation periods",
+                "Status": "OK" if periods else "NOT TESTED - PERIOD-001",
+                "Detail": ", ".join(map(str, periods)) if periods else "No validated periods",
+            },
+            {"Check": "Missing periods generated", "Status": "OK", "Detail": "No - output uses only validated source periods"},
+            {
+                "Check": "Fixed Assets evidence",
+                "Status": "OK" if reports.tax_depreciation_report is not None else "NOT PROVIDED",
+                "Detail": reports.tax_depreciation_source or "No validated depreciation schedule",
+            },
+        ]
+    )
+    row, _ = _write_simple_table(ws, output_checks, "Workbook Output Checks", 1, 1)
+
+    if workpaper.bs_checks is not None and not workpaper.bs_checks.empty:
+        row, _ = _write_simple_table(ws, workpaper.bs_checks, "Balance Sheet Test Checks", row + 3, 1)
+
+    review_items = getattr(workpaper, "review_items", None)
+    if review_items is not None and not review_items.empty:
+        _write_simple_table(ws, review_items, "Review Items", row + 3, 1)
+
+
 def write_workbook(reports, workpaper) -> None:
     logger.info("Writing workbook to %s", OUTPUT_PATH)
 
     wb = Workbook()
     wb.remove(wb.active)
 
-    # First two sheets: copy the selected original source sheets.
-    _copy_sheet_to_workbook(reports.pl_input, wb, SHEET_PL_RAW)
-    _copy_sheet_to_workbook(reports.bs_input, wb, SHEET_BS_RAW)
+    pl_ws = _copy_sheet_to_workbook(reports.pl_input, wb, SHEET_PL_RAW)
+    bs_ws = _copy_sheet_to_workbook(reports.bs_input, wb, SHEET_BS_RAW)
+    _append_review_output(pl_ws, workpaper.labelled_pl, workpaper.pl_label_summary, "profit_and_loss")
+    _append_review_output(bs_ws, workpaper.labelled_bs, workpaper.bs_label_summary, "balance_sheet")
 
     ws = wb.create_sheet(SHEET_RECONCILIATION)
-
-        # ------------------------------------------------------------------
-    # 1. P&L block with side labels
-    # ------------------------------------------------------------------
-        # ------------------------------------------------------------------
-    # 1. P&L block with ITR labels immediately beside P&L
-    # ------------------------------------------------------------------
-    pl_start_row = 1
-
-    pl_last_row, pl_last_col = _copy_report_area(
-        reports.pl_input,
-        ws,
-        pl_start_row,
-        1,
-        copy_formulas=True,
-    )
-
-    pl_itr_col = pl_last_col + 2
-    pl_review_col = pl_last_col + 3
-
-    ws.column_dimensions[get_column_letter(pl_itr_col)].width = 14
-    ws.column_dimensions[get_column_letter(pl_review_col)].width = 42
-
-    _write_side_labels(
-        ws,
-        workpaper.labelled_pl,
-        pl_start_row,
-        pl_itr_col,
-        pl_review_col,
-        report_type="profit_and_loss",
-    )
-
-    # Formula summary table goes beside the same P&L block.
-    # It does not depend on BS length.
-    pl_amount_col = _find_main_amount_col(
-        ws,
-        start_row=pl_start_row,
-        last_row=pl_last_row,
-        last_col=pl_last_col,
-    )
-
-    pl_summary_col = pl_review_col + 2
-
-    pl_summary_last_row, pl_summary_last_col = _write_pl_formula_summary_table(
-        ws,
-        title="ITR Totals",
-        start_row=pl_start_row,
-        start_col=pl_summary_col,
-        label_col=pl_itr_col,
-        amount_col=pl_amount_col,
-        data_start_row=pl_start_row,
-        data_last_row=pl_last_row,
-    )
-
-    # ------------------------------------------------------------------
-    # 2. BS block underneath P&L
-    # ------------------------------------------------------------------
-    bs_start_row = max(pl_last_row, pl_summary_last_row) + 4
-
-    bs_last_row, bs_last_col = _copy_report_area(
-        reports.bs_input,
-        ws,
-        bs_start_row,
-        1,
-        copy_formulas=True,
-    )
-
-    bs_itr_col = bs_last_col + 2
-    bs_review_col = bs_last_col + 3
-
-    ws.column_dimensions[get_column_letter(bs_itr_col)].width = 14
-    ws.column_dimensions[get_column_letter(bs_review_col)].width = 42
-
-    _write_side_labels(
-        ws,
-        workpaper.labelled_bs,
-        bs_start_row,
-        bs_itr_col,
-        bs_review_col,
-        report_type="balance_sheet",
-    )
-
-    # ------------------------------------------------------------------
-    # 3. BS checks underneath BS
-    # ------------------------------------------------------------------
-    bs_checks_start_row = bs_last_row + 3
-
-    bs_checks_last_row = _write_bs_checks(
-        ws,
-        workpaper.bs_checks,
-        bs_checks_start_row,
-        1,
-    )
-
-    # ------------------------------------------------------------------
-    # 4. Final tax reconciliation table underneath BS checks
-    # ------------------------------------------------------------------
-    tax_start_row = bs_checks_last_row + 4
-
-    tax_last_row, tax_last_col = _write_tax_reconciliation_table(
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
+    _, tax_last_col = _write_tax_reconciliation_table(
         ws,
         workpaper.tax_reconciliation,
-        "Final Tax Reconciliation",
-        tax_start_row,
+        "Income Tax Reconciliation",
+        1,
         1,
     )
+    _format_sheet(ws, tax_last_col)
+    ws.sheet_view.showGridLines = False
+    ws.freeze_panes = "A3"
 
-    # ------------------------------------------------------------------
-    # 5. Support tables beside final tax reconciliation
-    # ------------------------------------------------------------------
-    support_start_col = tax_last_col + 2
+    if reports.tax_depreciation_report is not None and reports.tax_depreciation_total is not None:
+        _copy_sheet_to_workbook(reports.tax_depreciation_report, wb, "Fixed Assets")
 
-    current_row = tax_start_row - 3
+    _write_inputs_sheet(wb, workpaper)
+    _write_checks_sheet(wb, reports, workpaper)
 
-    if workpaper.carry_forward_losses is not None and not workpaper.carry_forward_losses.empty:
-        current_row, _ = _write_simple_table(
-            ws,
-            workpaper.carry_forward_losses,
-            "Carry Forward Losses",
-            current_row + 3,
-            support_start_col,
-            input_table=True,
-        )
-
-    if workpaper.rd_breakdown is not None and not workpaper.rd_breakdown.empty:
-        current_row, _ = _write_simple_table(
-            ws,
-            workpaper.rd_breakdown,
-            "R&D Breakdown",
-            current_row + 3,
-            support_start_col,
-            input_table=True,
-        )
-
-    for title, table in getattr(workpaper, "support_tables", {}).items():
-        if table is None or table.empty:
-            continue
-        current_row, _ = _write_simple_table(
-            ws,
-            table,
-            title,
-            current_row + 3,
-            support_start_col,
-            input_table=True,
-        )
-
-    proposed = getattr(workpaper, "proposed_adjustments", None)
-    if proposed is not None and not proposed.empty:
-        current_row, _ = _write_simple_table(
-            ws,
-            proposed,
-            "Proposed Tax Adjustments - Not Posted Unless Approved",
-            current_row + 3,
-            support_start_col,
-            input_table=False,
-        )
-
-    if getattr(workpaper, "review_items", None) is not None and not workpaper.review_items.empty:
-        _write_simple_table(
-            ws,
-            workpaper.review_items,
-            "Review Items",
-            current_row + 3,
-            support_start_col,
-            input_table=False,
-        )
-
-    raw_last_col = max(
-        pl_last_col,
-        bs_last_col,
-        pl_summary_last_col,
-        tax_last_col,
-    )
-
-    _format_sheet(ws, raw_last_col)
-    
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.calculation.calcMode = "auto"

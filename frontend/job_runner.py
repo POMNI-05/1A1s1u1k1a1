@@ -72,10 +72,36 @@ DEFAULT_REQUESTED_TABLES: dict[str, bool] = {
     "psi": False,
 }
 
+DEFAULT_BACKEND_TIMEOUT_SECONDS = 180
+MIN_BACKEND_TIMEOUT_SECONDS = 30
+MAX_BACKEND_TIMEOUT_SECONDS = 1800
+
 # ── Basic helpers ─────────────────────────────────────────────────────────────
 
 def _timestamp() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _backend_timeout_seconds() -> int:
+    """Return a bounded backend timeout, allowing an environment override."""
+
+    raw_value = os.environ.get(
+        "TAX_BACKEND_TIMEOUT_SECONDS",
+        str(DEFAULT_BACKEND_TIMEOUT_SECONDS),
+    )
+    try:
+        timeout = int(raw_value)
+    except (TypeError, ValueError):
+        return DEFAULT_BACKEND_TIMEOUT_SECONDS
+    return min(max(timeout, MIN_BACKEND_TIMEOUT_SECONDS), MAX_BACKEND_TIMEOUT_SECONDS)
+
+
+def _timeout_output_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _as_list(value: Any) -> list[Any]:
@@ -362,6 +388,7 @@ def _run_v1_main(
         capture_output=True,
         check=False,
         env=env,
+        timeout=_backend_timeout_seconds(),
     )
 
 
@@ -673,14 +700,22 @@ def run_workpaper_job(
         # 4. Run the backend package with this job's isolated paths.
         result["backend_command"] = f"{sys.executable} -m v1.main"
 
-        completed = _run_v1_main(
-            job_options,
-            job_root=job_root,
-            input_dir=job_upload_dir,
-            output_path=backend_output,
-            log_dir=job_log_dir,
-            job_config_path=job_config_path,
-        )
+        try:
+            completed = _run_v1_main(
+                job_options,
+                job_root=job_root,
+                input_dir=job_upload_dir,
+                output_path=backend_output,
+                log_dir=job_log_dir,
+                job_config_path=job_config_path,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _build_error_result(
+                result,
+                f"Backend timed out after {exc.timeout} seconds. No output was published.",
+                _timeout_output_text(exc.stdout),
+                _timeout_output_text(exc.stderr),
+            )
 
         stdout = completed.stdout or ""
         stderr = completed.stderr or ""

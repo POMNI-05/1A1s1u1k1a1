@@ -75,13 +75,22 @@ class EndToEndTests(unittest.TestCase):
 
             workbook = load_workbook(output, data_only=True)
             self.assertIn("Tax Reconciliation", workbook.sheetnames)
-            values = [cell.value for row in workbook["Tax Reconciliation"] for cell in row]
-            self.assertIn("Proposed Tax Adjustments - Not Posted Unless Approved", values)
-            self.assertIn("FBT / Entertainment Review", values)
+            self.assertIn("Inputs & Overrides", workbook.sheetnames)
+            recon_values = [
+                cell.value for row in workbook["Tax Reconciliation"] for cell in row
+            ]
+            input_values = [
+                cell.value for row in workbook["Inputs & Overrides"] for cell in row
+            ]
+            self.assertIn(
+                "Proposed Tax Adjustments - Not Posted Unless Approved",
+                input_values,
+            )
+            self.assertIn("FBT / Entertainment Review", input_values)
             # Net profit is 900. The proposed 100 entertainment add-back is not
             # posted, so indicative tax at 30% is 270 rather than 300.
-            self.assertIn(270, values)
-            self.assertNotIn(300, values)
+            self.assertIn(270, recon_values)
+            self.assertNotIn(300, recon_values)
 
 
 if __name__ == "__main__":

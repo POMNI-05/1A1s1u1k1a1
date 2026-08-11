@@ -844,10 +844,10 @@ PL_RULES: list[LabelRule] = [
         "medium",
         "Check whether the company uses small business simplified depreciation. If SBE simplified depreciation applies, Item 6X should use tax depreciation and may support Item 10A/10B. If book depreciation is included for non-SBE or excluded assets, review add-back at 7W and tax deduction at 7F.",
         "Mapped depreciation/amortisation to Item 6X with capital allowance review.",
-        "",
-        "7F_decline_in_value",
-        "7F",
-        "subtract",
+        "7W",
+        "7W_non_deductible_expenses",
+        "7W",
+        "add",
     ),
 
     R(

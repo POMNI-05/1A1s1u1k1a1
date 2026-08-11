@@ -14,7 +14,6 @@ try:
     from .cleaner import CleanedReports, load_clean_report_bundle, clean_amount
     from .config import (
         AUTO_POST_TAX_DEPRECIATION_TO_7F,
-        CARRY_FORWARD_LOSSES_TEMPLATE,
         COMPANY_TAX_RATE_CATEGORY,
         RD_BREAKDOWN_TEMPLATE,
         RD_OFFSET_AMOUNT,
@@ -30,7 +29,6 @@ except ImportError:  # Direct-script compatibility.
     from cleaner import CleanedReports, load_clean_report_bundle, clean_amount
     from config import (
         AUTO_POST_TAX_DEPRECIATION_TO_7F,
-        CARRY_FORWARD_LOSSES_TEMPLATE,
         COMPANY_TAX_RATE_CATEGORY,
         RD_BREAKDOWN_TEMPLATE,
         RD_OFFSET_AMOUNT,
@@ -318,23 +316,31 @@ def _extract_reported_net_profit(clean_pl_df: pd.DataFrame) -> tuple[dict[str, f
 
     names = _row_names(candidates, account_col)
 
-    net_profit_rows = candidates[
-        names.str.fullmatch(
-            r"net profit|net loss|net profit / loss|net profit/\(loss\)|profit before tax|accounting profit before tax",
-            na=False,
-        )
-        | names.str.contains(
-            r"\bnet profit\b|\bnet loss\b|\bprofit before tax\b|\baccounting profit\b",
-            regex=True,
-            na=False,
-        )
+    excluded = names.str.contains(
+        r"after tax|\bnpat\b|attributable|comprehensive income",
+        regex=True,
+        na=False,
+    )
+    candidates = candidates[~excluded].copy()
+    names = _row_names(candidates, account_col)
+
+    priorities = [
+        (r"accounting profit(?:/\(loss\))? (?:before tax|pre[- ]?tax)", "Accounting profit before tax"),
+        (r"profit(?:/\(loss\))? (?:before tax|pre[- ]?tax)", "Profit before tax"),
+        (r"net profit(?:/\(loss\))? (?:before tax|pre[- ]?tax)", "Net profit before tax"),
+        (r"net profit|net loss|net profit / loss|net profit/\(loss\)", "Unambiguous net profit"),
     ]
 
-    if net_profit_rows.empty:
-        return {str(col): 0.0 for col in amount_cols}, "Net Profit / Profit Before Tax row not found"
+    for pattern, method in priorities:
+        matched = candidates[names.str.fullmatch(pattern, na=False)]
+        if not matched.empty:
+            row = matched.iloc[-1]
+            return (
+                {str(col): clean_amount(row.get(col, 0.0)) for col in amount_cols},
+                f"Reported {method} row",
+            )
 
-    row = net_profit_rows.iloc[-1]
-    return {str(col): clean_amount(row.get(col, 0.0)) for col in amount_cols}, "Reported Xero Net Profit / Profit Before Tax row"
+    return {str(col): 0.0 for col in amount_cols}, "PROFIT-001: pre-tax accounting profit row not found"
 
 
 def _calculate_net_profit_from_sections(clean_pl_df: pd.DataFrame) -> tuple[dict[str, float], str]:
@@ -373,16 +379,13 @@ def _extract_net_profit_by_period(clean_pl_df: pd.DataFrame) -> tuple[dict[str, 
     reported, reported_method = _extract_reported_net_profit(clean_pl_df)
     fallback, fallback_method = _calculate_net_profit_from_sections(clean_pl_df)
 
-    reported_all_zero = all(abs(v) < 0.005 for v in reported.values())
-    fallback_has_values = any(abs(v) > 0.005 for v in fallback.values())
-
     final = {}
     methods = {}
 
     for period, reported_value in reported.items():
         fallback_value = fallback.get(period, 0.0)
 
-        if reported_all_zero and fallback_has_values:
+        if abs(reported_value) < 0.005 and abs(fallback_value) > 0.005:
             final[period] = fallback_value
             methods[period] = fallback_method
         else:
@@ -392,9 +395,26 @@ def _extract_net_profit_by_period(clean_pl_df: pd.DataFrame) -> tuple[dict[str, 
     return final, methods
 
 
-def _get_adjustment_amount(adj: dict[str, Any], period: str) -> float:
+def _requested_period(periods: list[str]) -> str | None:
+    matches = [period for period in periods if str(SELECTED_INCOME_YEAR) in str(period)]
+    if len(matches) == 1:
+        return matches[0]
+    if not matches and len(periods) == 1:
+        return periods[0]
+    return None
+
+
+def _get_adjustment_amount(
+    adj: dict[str, Any],
+    period: str,
+    requested_period: str | None,
+) -> float:
     if "amounts" in adj:
         return float(adj.get("amounts", {}).get(period, 0.0))
+    # A scalar reviewed adjustment belongs to the requested income year only.
+    # Repeating it across every source period would fabricate historical data.
+    if period != requested_period:
+        return 0.0
     return float(adj.get("amount", 0.0))
 
 
@@ -409,6 +429,7 @@ def _manual_adjustment_rows(periods: list[str]) -> tuple[list[dict], list[dict],
     subtract_rows: list[dict] = []
     total_add_backs = {period: 0.0 for period in periods}
     total_subtractions = {period: 0.0 for period in periods}
+    requested_period = _requested_period(periods)
 
     for category, adjustments in TAX_ADJUSTMENTS.items():
         rule = WORKSHEET_2.get(category)
@@ -438,7 +459,7 @@ def _manual_adjustment_rows(periods: list[str]) -> tuple[list[dict], list[dict],
 
             for period in periods:
                 # Preserve deliberate reversals/credits entered by the reviewer.
-                amount = _get_adjustment_amount(adj, period)
+                amount = _get_adjustment_amount(adj, period, requested_period)
                 row[period] = amount
 
                 if abs(amount) > 0.005:
@@ -598,7 +619,7 @@ def _tax_depreciation_reconciliation_rows(
     """Optionally post extracted tax depreciation to 7F.
 
     Safe default is controlled by AUTO_POST_TAX_DEPRECIATION_TO_7F=False.
-    When enabled, this posts the amount to the first detected period.
+    When enabled, this posts the amount to the uniquely requested period.
     """
     rows: list[dict] = []
     total_subtractions = {period: 0.0 for period in periods}
@@ -621,8 +642,15 @@ def _tax_depreciation_reconciliation_rows(
         "Review note": f"Auto-posted from tax depreciation support schedule: {tax_depreciation_source or 'source not recorded'}",
     }
 
-    for idx, period in enumerate(periods):
-        amount = float(tax_depreciation_total) if idx == 0 else 0.0
+    requested_period = _requested_period(periods)
+    if requested_period is None:
+        logger.warning(
+            "PERIOD-001: tax depreciation was not posted because the requested period is ambiguous"
+        )
+        return rows, total_subtractions
+
+    for period in periods:
+        amount = float(tax_depreciation_total) if period == requested_period else 0.0
         row[period] = amount
         total_subtractions[period] += amount
 
@@ -758,13 +786,15 @@ def _build_tax_reconciliation(
 
     rows.append(taxable_row)
 
+    requested_period = _requested_period(periods)
     tax_rate_label = f"{TAX_RATE:.0%}" if TAX_RATE is not None else "review required"
     tax_row = {
         "Line Type": "detail",
         "Description": f"Indicative tax on taxable income - rate {tax_rate_label}",
         "ITR Ref": "",
         "Review note": (
-            ""
+            "Tax is calculated only for the requested income year. Other source periods "
+            "are intentionally blank."
             if TAX_RATE is not None
             else "Select and confirm the company tax rate before relying on tax payable."
         ),
@@ -774,7 +804,7 @@ def _build_tax_reconciliation(
 
     for period in periods:
         taxable_amount = max(taxable_income[period], 0.0)
-        if TAX_RATE is None:
+        if TAX_RATE is None or period != requested_period:
             tax_payable = None
         else:
             tax_result = calculate_company_tax(
@@ -859,6 +889,23 @@ def _build_tax_reconciliation(
     return pd.DataFrame(rows)[ordered_cols]
 
 
+def _build_carry_forward_losses_input(periods: list[str]) -> pd.DataFrame:
+    """Create blank reviewer inputs only for periods validated from the source report."""
+    return pd.DataFrame(
+        [
+            {
+                "Period": period,
+                "Opening losses": None,
+                "Losses utilised": None,
+                "New losses incurred": None,
+                "Closing losses": None,
+                "Status": "REVIEW INPUT REQUIRED",
+            }
+            for period in periods
+        ]
+    )
+
+
 def _extract_total_by_period(
     clean_df: pd.DataFrame,
     aliases: list[str],
@@ -909,25 +956,34 @@ def _build_bs_checks(clean_bs_df: pd.DataFrame) -> pd.DataFrame:
     total_equity = _extract_total_by_period(clean_bs_df, ["total equity"])
     net_assets = _extract_total_by_period(clean_bs_df, ["net assets"])
 
+    account_col = _get_account_col(clean_bs_df)
+    available_names = set(_row_names(clean_bs_df, account_col).tolist())
+    has_assets = "total assets" in available_names
+    has_liabilities = "total liabilities" in available_names
+    has_equity = "total equity" in available_names
+    has_net_assets = "net assets" in available_names
+
     equity_variance = {
         "Check": "TEST CHECK equity variance",
         "Calculation": "Total Assets - Total Liabilities - Total Equity",
+        "Status": "TESTED" if has_assets and has_liabilities and has_equity else "NOT TESTED - BS-001",
     }
 
     net_assets_variance = {
         "Check": "TEST CHECK net assets variance",
         "Calculation": "Net Assets - (Total Assets - Total Liabilities)",
+        "Status": "TESTED" if has_net_assets and has_assets and has_liabilities else "NOT TESTED - BS-001",
     }
 
     for period in amount_cols:
-        equity_variance[period] = round(
+        equity_variance[period] = None if equity_variance["Status"].startswith("NOT TESTED") else round(
             total_assets.get(period, 0.0)
             - total_liabilities.get(period, 0.0)
             - total_equity.get(period, 0.0),
             2,
         )
 
-        net_assets_variance[period] = round(
+        net_assets_variance[period] = None if net_assets_variance["Status"].startswith("NOT TESTED") else round(
             net_assets.get(period, 0.0)
             - (total_assets.get(period, 0.0) - total_liabilities.get(period, 0.0)),
             2,
@@ -1001,8 +1057,10 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
 
     bs_checks = _build_bs_checks(clean_bs_df)
 
+    periods = list(_extract_net_profit_by_period(clean_pl_df)[0].keys())
+
     carry_forward_losses = (
-        pd.DataFrame(CARRY_FORWARD_LOSSES_TEMPLATE)
+        _build_carry_forward_losses_input(periods)
         if table_requested("carry_forward_losses")
         else pd.DataFrame()
     )
@@ -1018,7 +1076,6 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
         if table_requested(key)
     }
 
-    periods = list(_extract_net_profit_by_period(clean_pl_df)[0].keys())
     proposed_adjustments = _build_proposed_adjustments(labelled_pl, periods)
 
     review_blocks = [

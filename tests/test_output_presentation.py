@@ -94,7 +94,60 @@ class OutputPresentationTests(unittest.TestCase):
 
             workbook = load_workbook(output, data_only=False)
             self.assertIn("Fixed Assets", workbook.sheetnames)
+            self.assertEqual(
+                workbook.sheetnames,
+                ["Profit and Loss", "Balance Sheet", "Fixed Assets", "Tax Reconciliation", "Checks"],
+            )
             self.assertEqual(workbook["Fixed Assets"]["A2"].value, "Total tax depreciation")
+
+    def test_raw_review_sheets_hide_tab3_decision_and_widen_notes(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            periods = ["2026"]
+            reports = SimpleNamespace(
+                pl_input=_source_report(root / "pl.xlsx", "P&L", periods, [("Sales", 100.0)]),
+                bs_input=_source_report(root / "bs.xlsx", "BS", periods, [("Cash", 100.0)]),
+                tax_depreciation_report=None,
+                tax_depreciation_total=None,
+                tax_depreciation_source=None,
+            )
+            workpaper = _workpaper(periods)
+            workpaper.labelled_pl.loc[0, "Review Note"] = "A long reviewer explanation."
+            output = root / "output.xlsx"
+            with patch("v1.write_workbook.OUTPUT_PATH", output):
+                write_workbook(reports, workpaper)
+
+            sheet = load_workbook(output, data_only=False)["Profit and Loss"]
+            headers = [cell.value for row in sheet.iter_rows() for cell in row]
+            self.assertNotIn("Tab 3 decision", headers)
+            review_header = next(
+                cell for row in sheet.iter_rows() for cell in row
+                if cell.value == "Review note"
+            )
+            self.assertEqual(sheet.column_dimensions[review_header.column_letter].width, 64)
+            self.assertTrue(sheet.cell(2, review_header.column).alignment.wrap_text)
+
+    def test_balance_sheet_uses_the_same_compact_formula_summary_pattern_as_pl(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder)
+            periods = ["2026"]
+            reports = SimpleNamespace(
+                pl_input=_source_report(root / "pl.xlsx", "P&L", periods, [("Net Profit", 100.0)]),
+                bs_input=_source_report(root / "bs.xlsx", "BS", periods, [("Cash", 100.0)]),
+                tax_depreciation_report=None,
+                tax_depreciation_total=None,
+                tax_depreciation_source=None,
+            )
+            output = root / "output.xlsx"
+            with patch("v1.write_workbook.OUTPUT_PATH", output):
+                write_workbook(reports, _workpaper(periods))
+
+            sheet = load_workbook(output, data_only=False)["Balance Sheet"]
+            values = [cell.value for row in sheet.iter_rows() for cell in row]
+            formulas = [value for value in values if isinstance(value, str) and value.startswith("=SUMIF(")]
+            self.assertIn("Balance Sheet ITR Totals", values)
+            self.assertNotIn("Balance Sheet ITR Summary", values)
+            self.assertTrue(formulas)
 
     def test_scalar_adjustment_and_loss_inputs_do_not_invent_period_values(self):
         periods = ["2026", "2025", "2024"]

@@ -5,8 +5,8 @@ Bridge between Streamlit UI and v1 backend.
 Stable design:
 - Give every request its own UUID-scoped inputs, output, logs and config.
 - Run the backend package as an isolated subprocess.
-- Pass selected ATO / ITR policy and owned paths through environment variables.
-- Optionally run a Gemini face-check against user inputs + workbook summary.
+- Pass a versioned request/result contract across the subprocess boundary.
+- Optionally run a schema-constrained, display-only AI review.
 - Copy the owned output into a session-scoped download history.
 - Remove transient job files by default.
 
@@ -27,7 +27,20 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, BinaryIO
 
+from ai_review import (
+    GeminiShadowReviewProvider,
+    GrokShadowReviewProvider,
+    WorkpaperRequest,
+    WorkpaperStatus,
+    audit_path_for_workpaper,
+    build_ai_review_audit_record,
+    read_workpaper_result,
+    write_ai_review_audit,
+    write_workpaper_request,
+)
+from ai_review.http_transport import UrllibJsonTransport
 from tax_calculators.company_tax import assess_base_rate_entity
+from tax_calculators.registry import SUPPORTED_YEARS, normalise_income_year
 from tax_calculators.validation import CalculatorError, to_decimal
 
 
@@ -57,8 +70,6 @@ logger = logging.getLogger(__name__)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-
-VALID_POLICY_YEARS = {"2024", "2025", "2026"}
 
 DEFAULT_REQUESTED_TABLES: dict[str, bool] = {
     "carry_forward_losses": False,
@@ -223,13 +234,12 @@ def _normalise_requested_tables(
     return tables
 
 
-def _normalise_policy_year(ato_policy_year: str = "2026") -> str:
-    year = str(ato_policy_year or "2026").strip()
+def _normalise_policy_year(ato_policy_year: str | None = None) -> str:
+    """Validate an explicitly selected policy year; never substitute another."""
 
-    if year not in VALID_POLICY_YEARS:
+    if ato_policy_year is None:
         return "2026"
-
-    return year
+    return normalise_income_year(ato_policy_year)
 
 
 def build_base_rate_entity_assessment(
@@ -291,6 +301,26 @@ def _base_rate_assessment_is_confirmed(
     return verified["eligible_on_supplied_figures"] is True
 
 
+def _normalise_reviewed_tax_depreciation(
+    amount: float | int | str | None,
+    approved_for_posting: bool = False,
+) -> dict[str, Any]:
+    """Keep a supplied 7F amount explicit and separate from posting approval."""
+
+    if amount is None or not str(amount).strip():
+        return {"amount": None, "approved_for_posting": False}
+
+    text = str(amount).strip().replace("$", "").replace(",", "")
+    decimal_amount = to_decimal(text, "reviewed_tax_depreciation")
+    if decimal_amount < 0:
+        raise CalculatorError("reviewed_tax_depreciation must not be negative")
+
+    return {
+        "amount": str(decimal_amount),
+        "approved_for_posting": approved_for_posting is True,
+    }
+
+
 def _build_job_options(
     ato_policy_year: str = "2026",
     requested_tables: dict[str, bool] | None = None,
@@ -300,6 +330,8 @@ def _build_job_options(
     client_name: str = "",
     company_tax_rate_category: str = "review_required",
     base_rate_entity_assessment: dict[str, Any] | None = None,
+    reviewed_tax_depreciation: float | int | str | None = None,
+    tax_depreciation_approved_for_posting: bool = False,
     retain_job_files: bool = False,
 ) -> dict[str, Any]:
     year = _normalise_policy_year(ato_policy_year)
@@ -324,6 +356,10 @@ def _build_job_options(
             else "review_required"
         ),
         "base_rate_entity_assessment": base_rate_entity_assessment or {},
+        "reviewed_tax_depreciation": _normalise_reviewed_tax_depreciation(
+            reviewed_tax_depreciation,
+            tax_depreciation_approved_for_posting,
+        ),
         "retain_job_files": bool(retain_job_files),
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "source": "frontend/job_runner.py",
@@ -355,31 +391,17 @@ def _write_job_config(job_options: dict[str, Any], path: Path) -> Path:
 # ── Backend subprocess ────────────────────────────────────────────────────────
 
 def _run_v1_main(
-    job_options: dict[str, Any],
     *,
-    job_root: Path,
-    input_dir: Path,
-    output_path: Path,
-    log_dir: Path,
-    job_config_path: Path,
+    request_path: Path,
+    result_path: Path,
 ) -> subprocess.CompletedProcess:
     if not V1_MAIN_PATH.exists():
         raise FileNotFoundError(f"Cannot find backend main.py at: {V1_MAIN_PATH}")
 
     env = os.environ.copy()
 
-    env["ATO_POLICY_YEAR"] = str(job_options.get("ato_policy_year", "2026"))
-    env["ITR_POLICY_YEAR"] = str(job_options.get("itr_policy_year", "2026"))
-    env["SELECTED_INCOME_YEAR"] = str(job_options.get("ato_policy_year", "2026"))
-    env["COMPANY_TAX_RATE_CATEGORY"] = str(
-        job_options.get("company_tax_rate_category", "review_required")
-    )
-    env["TAX_JOB_CONFIG_PATH"] = str(job_config_path)
-    env["TAX_JOB_WORK_DIR"] = str(job_root)
-    env["TAX_DATA_DIR"] = str(input_dir)
-    env["TAX_OUTPUT_DIR"] = str(output_path.parent)
-    env["TAX_OUTPUT_PATH"] = str(output_path)
-    env["TAX_LOG_DIR"] = str(log_dir)
+    env["TAX_WORKPAPER_REQUEST_PATH"] = str(request_path)
+    env["TAX_WORKPAPER_RESULT_PATH"] = str(result_path)
 
     return subprocess.run(
         [sys.executable, "-m", "v1.main"],
@@ -558,6 +580,62 @@ Return format:
         }
 
 
+def _run_ai_shadow_review(
+    *,
+    workpaper_result,
+    ai_provider: str,
+    api_key: str,
+    model: str,
+) -> dict[str, Any]:
+    """Run schema-constrained review evidence through the selected AI adapter."""
+
+    provider_kwargs = {
+        "api_key": api_key,
+        "model": model,
+        "transport": UrllibJsonTransport(),
+    }
+    if ai_provider == "Gemini":
+        provider = GeminiShadowReviewProvider(**provider_kwargs)
+    elif ai_provider == "Grok":
+        provider = GrokShadowReviewProvider(**provider_kwargs)
+    else:
+        return {
+            "status": "skipped",
+            "summary": f"Unsupported AI review provider: {ai_provider}.",
+            "findings": [],
+        }
+
+    try:
+        review = provider.review(workpaper_result, workpaper_result.decision_traces)
+    except Exception as exc:
+        logger.exception("AI shadow review failed for provider=%s", ai_provider)
+        return {
+            "status": "error",
+            "summary": f"{ai_provider} shadow review failed: {type(exc).__name__}: {exc}",
+            "findings": [],
+        }
+
+    findings = [
+        {
+            "severity": finding.severity.value,
+            "decision_id": finding.decision_id,
+            "evidence": list(finding.evidence),
+            "missing_facts": list(finding.missing_facts),
+            "recommended_review_action": finding.recommended_review_action,
+        }
+        for finding in review.findings
+    ]
+    return {
+        "status": "success",
+        "summary": (
+            f"{ai_provider} returned {len(findings)} display-only, schema-validated "
+            "review finding(s)."
+        ),
+        "findings": findings,
+        "limitations": list(review.limitations),
+    }
+
+
 # ── Error helper ──────────────────────────────────────────────────────────────
 
 def _build_error_result(
@@ -596,6 +674,8 @@ def run_workpaper_job(
     run_ai_face_check: bool = False,
     company_tax_rate_category: str = "review_required",
     base_rate_entity_assessment: dict[str, Any] | None = None,
+    reviewed_tax_depreciation: float | int | str | None = None,
+    tax_depreciation_approved_for_posting: bool = False,
     history_owner_id: str = "local",
     ai_provider: str = "None",
     ai_model: str = "",
@@ -635,7 +715,14 @@ def run_workpaper_job(
         "client_name": client_name or "",
         "job_options": {},
         "job_config_path": "",
+        "workpaper_request_path": "",
+        "workpaper_result_path": "",
+        "workpaper_result": None,
         "ai_face_check": None,
+        "ai_review_audit_path": "",
+        "error_code": None,
+        "selected_income_year": "",
+        "supported_income_years": list(SUPPORTED_YEARS),
         "error_message": None,
         "job_id": "",
         "job_cleaned_up": False,
@@ -645,17 +732,32 @@ def run_workpaper_job(
 
     try:
         # 0. Build frontend-selected job options.
-        job_options = _build_job_options(
-            ato_policy_year=ato_policy_year,
-            requested_tables=requested_tables,
-            reviewer_notes=reviewer_notes,
-            company_profile=company_profile,
-            document_description=document_description,
-            client_name=client_name,
-            company_tax_rate_category=company_tax_rate_category,
-            base_rate_entity_assessment=base_rate_entity_assessment,
-            retain_job_files=retain_job_files,
-        )
+        try:
+            job_options = _build_job_options(
+                ato_policy_year=ato_policy_year,
+                requested_tables=requested_tables,
+                reviewer_notes=reviewer_notes,
+                company_profile=company_profile,
+                document_description=document_description,
+                client_name=client_name,
+                company_tax_rate_category=company_tax_rate_category,
+                base_rate_entity_assessment=base_rate_entity_assessment,
+                reviewed_tax_depreciation=reviewed_tax_depreciation,
+                tax_depreciation_approved_for_posting=tax_depreciation_approved_for_posting,
+                retain_job_files=retain_job_files,
+            )
+        except CalculatorError as exc:
+            # Do not let an invalid year become a generic traceback.  The UI
+            # can now tell the user exactly what to change before any upload is
+            # written or backend process is started.
+            result.update(
+                {
+                    "error_code": "unsupported_income_year",
+                    "selected_income_year": str(ato_policy_year),
+                    "error_message": str(exc),
+                }
+            )
+            return result
 
         result["job_options"] = job_options
 
@@ -676,7 +778,8 @@ def run_workpaper_job(
         job_upload_dir = job_root / "inputs"
         job_output_dir = job_root / "output"
         job_log_dir = job_root / "logs"
-        job_config_path = job_root / "job_config.json"
+        request_path = job_root / "request.json"
+        result_path = job_root / "result.json"
         backend_output = job_output_dir / "tax_workpaper.xlsx"
         job_upload_dir.mkdir(parents=True, exist_ok=True)
         job_output_dir.mkdir(parents=True, exist_ok=True)
@@ -693,21 +796,27 @@ def run_workpaper_job(
         # Inputs already live in this job's isolated backend data directory.
         result["backend_data_paths"] = [str(path) for path in saved_inputs]
 
-        # 3b. Write frontend-selected tax settings for backend.
-        job_config_path = _write_job_config(job_options, job_config_path)
-        result["job_config_path"] = str(job_config_path)
+        # 3b. Write the explicit backend request contract.
+        request = WorkpaperRequest(
+            job_id=job_id,
+            income_year=job_options["ato_policy_year"],
+            work_dir=str(job_root),
+            input_dir=str(job_upload_dir),
+            input_paths=tuple(str(path) for path in saved_inputs),
+            output_path=str(backend_output),
+            log_dir=str(job_log_dir),
+            job_options=job_options,
+        )
+        write_workpaper_request(request, request_path)
+        result["workpaper_request_path"] = str(request_path)
 
         # 4. Run the backend package with this job's isolated paths.
         result["backend_command"] = f"{sys.executable} -m v1.main"
 
         try:
             completed = _run_v1_main(
-                job_options,
-                job_root=job_root,
-                input_dir=job_upload_dir,
-                output_path=backend_output,
-                log_dir=job_log_dir,
-                job_config_path=job_config_path,
+                request_path=request_path,
+                result_path=result_path,
             )
         except subprocess.TimeoutExpired as exc:
             return _build_error_result(
@@ -724,6 +833,48 @@ def run_workpaper_job(
         result["backend_log"] = full_log
         result["warnings"] = _extract_warnings(stdout, stderr)
         result["detected"] = _detect_reports_from_log(stdout, stderr)
+
+        if not result_path.exists():
+            return _build_error_result(
+                result,
+                (
+                    "Backend completed, but this job's result contract was not found."
+                    if completed.returncode == 0
+                    else f"Backend exited with code {completed.returncode} before writing its result contract."
+                ),
+                stdout,
+                stderr,
+            )
+
+        try:
+            workpaper_result = read_workpaper_result(result_path)
+        except Exception as exc:
+            return _build_error_result(
+                result,
+                f"Backend result contract was invalid: {type(exc).__name__}: {exc}",
+                stdout,
+                stderr,
+            )
+
+        # v1 writes its typed failure result before returning a non-zero exit
+        # code. Read it first so the UI can render an intentional safety stop
+        # (such as CELL-002) rather than a generic subprocess failure.
+        result["workpaper_result_path"] = str(result_path)
+        result["workpaper_result"] = {
+            "status": workpaper_result.status.value,
+            "income_year": workpaper_result.income_year,
+            "review_item_count": len(workpaper_result.review_items),
+            "decision_trace_count": len(workpaper_result.decision_traces),
+        }
+        if workpaper_result.status != WorkpaperStatus.COMPLETED:
+            result["error_code"] = workpaper_result.error_code
+            result["selected_income_year"] = workpaper_result.income_year
+            return _build_error_result(
+                result,
+                workpaper_result.error_message or "Backend reported an unsuccessful workpaper run.",
+                stdout,
+                stderr,
+            )
 
         if completed.returncode != 0:
             return _build_error_result(
@@ -744,26 +895,18 @@ def run_workpaper_job(
 
         result["backend_output_path"] = str(backend_output)
 
-        # 5b. Optional Gemini face-check before copying final download.
+        # 5b. Optional schema-constrained, display-only AI review.
         if run_ai_face_check:
-            if ai_provider != "Gemini":
-                result["ai_face_check"] = {
-                    "status": "skipped",
-                    "summary": "Only Gemini face-check is currently supported.",
-                }
-            else:
-                result["ai_face_check"] = _run_gemini_face_check(
-                    job_options=job_options,
-                    backend_output=backend_output,
-                    stdout=stdout,
-                    stderr=stderr,
-                    api_key=ai_api_key,
-                    model=ai_model,
-                )
+            result["ai_face_check"] = _run_ai_shadow_review(
+                workpaper_result=workpaper_result,
+                ai_provider=ai_provider,
+                api_key=ai_api_key,
+                model=ai_model,
+            )
         else:
             result["ai_face_check"] = {
                 "status": "skipped",
-                "summary": "Gemini face-check was not selected.",
+                "summary": "AI shadow review was not selected.",
             }
 
         # 6. Copy backend output into frontend/downloads.
@@ -773,11 +916,24 @@ def run_workpaper_job(
             history_owner_id=history_owner_id,
         )
 
+        # Keep an immutable review response plus a separately editable
+        # accountant disposition beside the final workbook.  This sidecar is
+        # not read by the backend and can never influence the tax outcome.
+        audit_path = audit_path_for_workpaper(frontend_output)
+        audit_record = build_ai_review_audit_record(
+            workpaper_result=workpaper_result,
+            provider_name=ai_provider if run_ai_face_check else "None",
+            model=ai_model if run_ai_face_check else "",
+            review_response=result["ai_face_check"],
+        )
+        write_ai_review_audit(audit_record, audit_path)
+
         result.update(
             {
                 "status": "success",
                 "output_path": frontend_output,
                 "output_name": output_name,
+                "ai_review_audit_path": str(audit_path),
                 "error_message": None,
             }
         )

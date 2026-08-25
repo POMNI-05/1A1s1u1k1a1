@@ -75,6 +75,21 @@ class PolicyYearTests(unittest.TestCase):
         self.assertEqual(psi["Treatment"], "review_only")
         self.assertNotIn("PCG 2025/5", psi["Review Note"])
 
+    def test_section_only_expense_keeps_6s_answer_but_requires_review_for_any_year(self):
+        for year in ("2024", "2025", "2026"):
+            with self.subTest(year=year):
+                result = self._matcher_for(year)(
+                    "Unexplained clearing charge",
+                    "profit_and_loss",
+                    "Operating expenses",
+                )
+                self.assertEqual(result["ITR Ref"], "Exp - 6S")
+                self.assertEqual(result["ITR Label"], "All other expenses")
+                self.assertEqual(result["Treatment"], "review_only")
+                self.assertEqual(result["Confidence"], "low")
+                self.assertEqual(result["Rule Source"], "section_fallback_review")
+                self.assertIn("account-name rule matched", result["Review Note"])
+
 
 if __name__ == "__main__":
     unittest.main()

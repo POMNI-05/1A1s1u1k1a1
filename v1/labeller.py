@@ -26,6 +26,7 @@ except ImportError:  # Direct-script compatibility.
 LABEL_COLUMNS = [
     "ITR Ref",
     "ITR Label",
+    "Tab 3 Decision",
     "Treatment",
     "Confidence",
     "Review Note",
@@ -40,8 +41,32 @@ LABEL_COLUMNS = [
     "Override Applied",
     "Override Name",
     "Override Reason",
+    "Rule ID",
+    "Rule Pack",
+    "Matched Pattern",
+    "Matched Text",
+    "Rule Source",
     "Auto Post",
 ]
+
+
+# These are the only source Balance Sheet total rows for which the current
+# rules packs hold direct Item 8 aggregate references.  Other totals (for
+# example Net Assets and Total Equity) remain structural/check rows until a
+# reviewed derived-total calculation is introduced; they must not inherit a
+# weak section fallback merely because they happen to be totals.
+_DIRECT_BALANCE_SHEET_TOTALS = frozenset(
+    {
+        "total current assets",
+        "total non-current assets",
+        "total non current assets",
+        "total assets",
+        "total current liabilities",
+        "total non-current liabilities",
+        "total non current liabilities",
+        "total liabilities",
+    }
+)
 
 
 def _get_matcher():
@@ -90,10 +115,69 @@ def _normalise_text(value) -> str:
     return "" if text.lower() in {"nan", "none"} else text
 
 
+def _has_balance_sheet_section_conflict(account_name: object, report_section: object) -> bool:
+    """Return true for a narrow cash/bank-under-liabilities contradiction."""
+
+    account = " ".join(_normalise_text(account_name).lower().split())
+    section = " ".join(_normalise_text(report_section).lower().split())
+    if "liabilit" not in section:
+        return False
+    if any(term in account for term in ("loan", "overdraft", "facility", "borrow")):
+        return False
+    return any(
+        term in account
+        for term in ("cash", "bank account", "business bank", "cheque account", "savings account")
+    )
+
+
+def _apply_balance_sheet_section_conflict_review(
+    mapping: dict,
+    *,
+    account_name: object,
+    report_section: object,
+) -> dict:
+    """Create a review-only record; do not silently correct source evidence."""
+
+    if not _has_balance_sheet_section_conflict(account_name, report_section):
+        return mapping
+
+    result = dict(mapping)
+    existing_reason = str(result.get("Label Reason", "") or "").strip()
+    result.update(
+        {
+            # `Review` is an explicit UI/contract sentinel, not an ITR filing
+            # label.  It keeps a structural review visible and compatible with
+            # existing result readers without inventing a tax classification.
+            "ITR Ref": "Review",
+            "ITR Label": "Balance-sheet structural conflict — review",
+            "Treatment": "review_only",
+            "Confidence": "high",
+            "Review Note": (
+                "Account name suggests cash/bank, but the source report places it under "
+                "liabilities. Confirm the account nature and source report structure."
+            ),
+            "Label Reason": " ".join(
+                part
+                for part in (
+                    existing_reason,
+                    "Structural conflict: cash/bank-like account under a liability section.",
+                )
+                if part
+            ),
+            "Rule ID": "system-bs-section-conflict-cash-under-liability",
+            "Matched Pattern": "cash/bank account under liabilities",
+            "Matched Text": str(account_name or ""),
+            "Rule Source": "structural_validation",
+        }
+    )
+    return result
+
+
 def _blank_label(treatment: str = "structure_or_check_only") -> dict:
     return {
         "ITR Ref": "",
         "ITR Label": "",
+        "Tab 3 Decision": "No use in Tab 3",
         "Treatment": treatment,
         "Confidence": "",
         "Review Note": "",
@@ -108,6 +192,11 @@ def _blank_label(treatment: str = "structure_or_check_only") -> dict:
         "Override Applied": "",
         "Override Name": "",
         "Override Reason": "",
+        "Rule ID": "",
+        "Rule Pack": "",
+        "Matched Pattern": "",
+        "Matched Text": "",
+        "Rule Source": "",
     }
 
 
@@ -128,20 +217,45 @@ def _normalise_mapping(mapping: dict) -> dict:
     clean["Support Key"] = str(clean.get("Support Key", "") or "").strip()
     clean["Support Display Ref"] = str(clean.get("Support Display Ref", "") or "").strip()
     clean["Support Label"] = str(clean.get("Support Label", "") or "").strip()
+    clean["Rule ID"] = str(clean.get("Rule ID", "") or "").strip()
+    clean["Rule Pack"] = str(clean.get("Rule Pack", "") or "").strip()
+    clean["Matched Pattern"] = str(clean.get("Matched Pattern", "") or "").strip()
+    clean["Matched Text"] = str(clean.get("Matched Text", "") or "").strip()
+    clean["Rule Source"] = str(clean.get("Rule Source", "") or "").strip()
 
     return clean
 
 
+def _tab_3_decision(mapping: dict, report_type: str) -> str:
+    """Return the high-threshold source-to-Item-7 routing decision.
+
+    A Balance Sheet line may explain an Item 8 balance or support later review,
+    but it does not directly reconcile accounting profit to Item 7T.  Only a
+    P&L account with an explicit Item 7 reference and add/subtract direction
+    can enter the Tab 3 pre-calculation.
+    """
+    if report_type != "profit_and_loss":
+        return "No use in Tab 3"
+
+    recon_ref = str(mapping.get("Recon ITR Ref", "") or "").strip()
+    direction = str(mapping.get("Recon Direction", "") or "").strip().lower()
+    if recon_ref and direction in {"add", "subtract"}:
+        return "Use in Tab 3"
+    return "No use in Tab 3"
+
+
 def _should_label_row(row_type: str, report_type: str, account_name: str) -> bool:
     row_type = row_type.lower().strip()
-    account_name_lower = str(account_name or "").lower()
+    account_name_lower = " ".join(str(account_name or "").lower().split())
 
     if row_type == "account":
         return True
 
-    # Balance Sheet totals are direct Item 8 candidates.
+    # Only reviewed Balance Sheet aggregate rows are direct Item 8 candidates.
+    # Net Assets/Total Equity and similar validation totals must remain
+    # structure-only rather than receiving a section-fallback confidence label.
     if report_type == "balance_sheet" and row_type == "total":
-        return True
+        return account_name_lower in _DIRECT_BALANCE_SHEET_TOTALS
 
     # P&L net profit/profit before tax is the tax reconciliation base.
     if (
@@ -173,12 +287,18 @@ def _net_profit_mapping() -> dict:
         "Support Key": "",
         "Support Display Ref": "",
         "Support Label": "",
+        "Rule ID": "system-net-profit",
+        "Rule Pack": "",
+        "Matched Pattern": "net profit/profit before tax total",
+        "Matched Text": "",
+        "Rule Source": "system",
     }
 
 
 def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
     out = df.copy()
     match_financial_label = _get_matcher()
+    policy_year = get_policy_year("2026")
     user_overrides = load_overrides()
 
     if out.empty:
@@ -196,7 +316,9 @@ def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
         report_section = row.get("Report Section", "")
 
         if not _should_label_row(row_type, report_type, account_name):
-            labels.append(_blank_label())
+            blank_mapping = _blank_label()
+            blank_mapping["Tab 3 Decision"] = _tab_3_decision(blank_mapping, report_type)
+            labels.append(blank_mapping)
             continue
 
         if (
@@ -223,6 +345,16 @@ def label_report(df: pd.DataFrame, report_type: str) -> pd.DataFrame:
             report_section=str(report_section or ""),
             overrides=user_overrides,
         )
+        if report_type == "balance_sheet":
+            final_mapping = _apply_balance_sheet_section_conflict_review(
+                final_mapping,
+                account_name=account_name,
+                report_section=report_section,
+            )
+        final_mapping["Tab 3 Decision"] = _tab_3_decision(final_mapping, report_type)
+        final_mapping["Rule Pack"] = f"ITR {policy_year}"
+        if not final_mapping.get("Matched Text"):
+            final_mapping["Matched Text"] = str(account_name or "")
 
         labels.append(_normalise_mapping(final_mapping))
 

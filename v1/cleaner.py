@@ -17,8 +17,10 @@ Design rule:
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Iterable
 
@@ -98,6 +100,19 @@ HELPER_COLS = {
     "label reason",
     "recon itr ref",
     "account label",
+}
+
+# A generated workpaper is sometimes re-uploaded as evidence.  Its copied
+# source report remains useful, but its right-hand ITR columns are not source
+# amounts and must never participate in period/amount detection.
+GENERATED_OUTPUT_MARKERS = {
+    "itr label",
+    "itr ref",
+    "confidence",
+    "label reason",
+    "review note",
+    "itr totals",
+    "balance sheet itr summary",
 }
 
 PL_TITLE_KEYWORDS = [
@@ -187,33 +202,67 @@ class CleanedReports:
     tax_depreciation_total: float | None = None
     tax_depreciation_source: str | None = None
     tax_depreciation_report: ReportInput | None = None
+    tax_depreciation_matches_selected_period: bool = False
+
+
+class AmountParseStatus(str, Enum):
+    """Meaning of a source amount before it enters calculation logic."""
+
+    BLANK = "blank"
+    VALID = "valid"
+    INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class AmountParseResult:
+    """A source monetary value with its parsing outcome preserved."""
+
+    value: float | None
+    status: AmountParseStatus
+    raw_value: object
+
+
+def parse_amount(value) -> AmountParseResult:
+    """Parse a monetary cell without silently converting invalid text to zero."""
+
+    if pd.isna(value):
+        return AmountParseResult(None, AmountParseStatus.BLANK, value)
+
+    if isinstance(value, bool):
+        return AmountParseResult(None, AmountParseStatus.INVALID, value)
+
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if math.isfinite(number):
+            return AmountParseResult(number, AmountParseStatus.VALID, value)
+        return AmountParseResult(None, AmountParseStatus.INVALID, value)
+
+    text = str(value).strip()
+    if text.lower() in {"", "nan", "none", "-", "--"}:
+        return AmountParseResult(None, AmountParseStatus.BLANK, value)
+
+    negative = text.startswith("(") and text.endswith(")")
+    if negative:
+        text = text[1:-1]
+
+    cleaned = re.sub(r"[$,%\s,]", "", text)
+    try:
+        number = float(cleaned)
+    except ValueError:
+        return AmountParseResult(None, AmountParseStatus.INVALID, value)
+
+    if not math.isfinite(number):
+        return AmountParseResult(None, AmountParseStatus.INVALID, value)
+    return AmountParseResult(-number if negative else number, AmountParseStatus.VALID, value)
 
 
 def clean_amount(value) -> float:
-    if pd.isna(value):
-        return 0.0
+    """Return a calculation value, rejecting invalid source monetary text."""
 
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return float(value)
-
-    s = str(value).strip()
-
-    if s.lower() in {"", "nan", "none", "-", "--"}:
-        return 0.0
-
-    negative = s.startswith("(") and s.endswith(")")
-
-    if negative:
-        s = s[1:-1]
-
-    s = re.sub(r"[$,%\s,]", "", s)
-
-    try:
-        number = float(s)
-    except ValueError:
-        return 0.0
-
-    return -number if negative else number
+    result = parse_amount(value)
+    if result.status == AmountParseStatus.INVALID:
+        raise ValueError(f"CELL-002: unparseable monetary value: {value!r}")
+    return 0.0 if result.value is None else result.value
 
 
 def _invalid_amount_value(value) -> bool:
@@ -306,6 +355,9 @@ def _candidate_label_cols(
         if lower in HELPER_COLS:
             continue
 
+        if lower.endswith("parse status"):
+            continue
+
         if "variance" in lower or "%" in lower:
             continue
 
@@ -368,6 +420,45 @@ def _sheet_names(path: Path) -> list[str]:
 
 def _read_excel_sheet(path: Path, sheet_name: str | int) -> pd.DataFrame:
     return pd.read_excel(path, sheet_name=sheet_name, header=None)
+
+
+def _remove_generated_output_columns(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Remove known generated ITR helper columns from a re-uploaded output.
+
+    This is intentionally narrow: only columns with a generated-workpaper
+    marker in the first 40 rows are removed.  For a two-column ITR summary,
+    remove its immediately following amount/formula column as well.  Raw
+    source evidence remains unchanged on disk.
+    """
+
+    generated_columns: set[int] = set()
+    for col_idx in range(raw_df.shape[1]):
+        values = {
+            normalise_match_text(value)
+            for value in raw_df.iloc[:40, col_idx].tolist()
+            if not pd.isna(value)
+        }
+        matched_markers = values & GENERATED_OUTPUT_MARKERS
+        if not matched_markers:
+            continue
+
+        generated_columns.add(col_idx)
+        if {"itr totals", "balance sheet itr summary"} & matched_markers:
+            generated_columns.add(col_idx + 1)
+
+    if not generated_columns:
+        return raw_df
+
+    keep_columns = [
+        col_idx
+        for col_idx in range(raw_df.shape[1])
+        if col_idx not in generated_columns
+    ]
+    logger.info(
+        "INTAKE-004: ignored generated workpaper helper columns=%s",
+        sorted(generated_columns),
+    )
+    return raw_df.iloc[:, keep_columns].copy()
 
 
 def _first_rows_text(raw_df: pd.DataFrame, rows: int = 15) -> str:
@@ -599,7 +690,15 @@ def find_data_start_row_in_df(raw_df: pd.DataFrame, scan_rows: int = 80) -> int:
         if any(v in {"account", "description", "account name", "name"} for v in values):
             score += 6
 
-        if any(re.search(r"20\d{2}|30 june|30 jun|year", v) for v in values):
+        # Do not treat a ledger balance such as 5,352,063 as a period merely
+        # because it contains the digit sequence 2063.  A period header must
+        # be an explicit year/date label, not an arbitrary numeric cell.
+        if any(
+            re.search(r"30 june|30 jun|\byear\b", v)
+            or re.fullmatch(r"20\d{2}(?:\.0)?", v)
+            or re.match(r"20\d{2}[-/]\d{1,2}[-/]\d{1,2}", v)
+            for v in values
+        ):
             score += 2
 
         if sum(v not in {"", "nan", "none"} for v in values) >= 2:
@@ -641,6 +740,36 @@ def detect_account_col(df: pd.DataFrame) -> str:
     return best
 
 
+def _is_report_amount_header(column_name: object) -> bool:
+    """Return whether a header can represent a report amount period/value.
+
+    Xero exports commonly contain blank structural columns and `[FX]` marker
+    columns beside an Account column.  Numeric density alone cannot promote
+    those columns to money: the header must say it is a period or amount.
+    """
+    header = normalise_match_text(column_name)
+    if not header or header.startswith("column "):
+        return False
+
+    return bool(
+        re.fullmatch(r"20\d{2}(?:\.0)?", header)
+        or re.search(r"\b30\s+(?:june|jun)\b|\byear\s+ended\b|\bas\s+at\b", header)
+        or header
+        in {
+            "amount",
+            "actual",
+            "balance",
+            "closing balance",
+            "debit",
+            "credit",
+            "cost",
+            "depreciation",
+            "closing value",
+        }
+        or bool(re.search(r"depreciation|decline in value|tax deduction", header))
+    )
+
+
 def detect_amount_cols(df: pd.DataFrame, account_col: str | None = None) -> list[str]:
     account_col = account_col or detect_account_col(df)
     amount_cols: list[str] = []
@@ -657,7 +786,15 @@ def detect_amount_cols(df: pd.DataFrame, account_col: str | None = None) -> list
         if "variance" in lower or "%" in lower:
             continue
 
-        cleaned = df[col].apply(clean_amount)
+        # Do not parse a structural/separator/annotation column just because
+        # it happens to contain digits.  This is the Xero `Column 1` false
+        # positive that previously surfaced headings such as "Assets" as
+        # CELL-002 amount failures.
+        if not _is_report_amount_header(col):
+            continue
+
+        parsed = df[col].apply(parse_amount)
+        cleaned = parsed.map(lambda result: result.value or 0.0)
         raw_has_digits = df[col].astype(str).str.contains(r"\d", na=False, regex=True)
         raw_has_errors = df[col].apply(_invalid_amount_value)
 
@@ -779,6 +916,8 @@ def add_row_type(df: pd.DataFrame, account_col: str, amount_cols: list[str]) -> 
         "total other income",
         "total operating expenses",
         "total expenses",
+        "gross profit",
+        "gross loss",
         "net profit",
         "net loss",
         "net profit / loss",
@@ -881,26 +1020,40 @@ def clean_report_input(report_input: ReportInput) -> pd.DataFrame:
             "side by side and cannot be safely paired"
         )
 
-    start_row = find_data_start_row_in_df(report_input.raw_df)
-    df = _table_from_raw_df(report_input.raw_df, start_row)
+    raw_df = _remove_generated_output_columns(report_input.raw_df)
+    start_row = find_data_start_row_in_df(raw_df)
+    df = _table_from_raw_df(raw_df, start_row)
 
     structure = detect_report_structure(df)
     account_col = structure.account_col
 
-    invalid_cells = []
+    parsed_amounts: dict[str, pd.Series] = {}
+    invalid_excel_cells = []
+    invalid_amount_cells = []
     for col in structure.amount_cols:
-        for row_index, value in df[col].items():
-            if _invalid_amount_value(value):
-                invalid_cells.append(f"{col} row {int(row_index) + start_row + 2}: {value}")
+        parsed = df[col].apply(parse_amount)
+        parsed_amounts[col] = parsed
+        for row_index, result in parsed.items():
+            if result.status == AmountParseStatus.INVALID:
+                cell = f"{col} row {int(row_index) + start_row + 2}: {result.raw_value}"
+                if _invalid_amount_value(result.raw_value):
+                    invalid_excel_cells.append(cell)
+                else:
+                    invalid_amount_cells.append(cell)
 
-    if invalid_cells:
-        sample = "; ".join(invalid_cells[:5])
+    if invalid_excel_cells:
+        sample = "; ".join(invalid_excel_cells[:5])
         raise ValueError(f"CELL-001: invalid Excel amount value(s): {sample}")
+    if invalid_amount_cells:
+        sample = "; ".join(invalid_amount_cells[:5])
+        raise ValueError(f"CELL-002: unparseable monetary value(s): {sample}")
 
     df[account_col] = standardise_account_names(df[account_col])
 
     for col in structure.amount_cols:
-        df[col] = df[col].apply(clean_amount)
+        parsed = parsed_amounts[col]
+        df[col] = parsed.map(lambda result: result.value)
+        df[f"{col} Parse Status"] = parsed.map(lambda result: result.status.value)
 
     # Internal visible row label.
     # This is used for headings/totals that may sit outside the formal Account column.
@@ -993,7 +1146,13 @@ def _clean_support_sheet(raw_df: pd.DataFrame) -> pd.DataFrame:
     amount_cols = detect_amount_cols(df, account_col)
 
     for col in amount_cols:
-        df[col] = df[col].apply(clean_amount)
+        parsed = df[col].apply(parse_amount)
+        invalid = parsed[parsed.map(lambda result: result.status == AmountParseStatus.INVALID)]
+        if not invalid.empty:
+            samples = "; ".join(str(result.raw_value) for result in invalid.iloc[:5])
+            raise ValueError(f"CELL-002: unparseable support-schedule amount value(s): {samples}")
+        df[col] = parsed.map(lambda result: result.value)
+        df[f"{col} Parse Status"] = parsed.map(lambda result: result.status.value)
 
     return df
 
@@ -1052,6 +1211,20 @@ def extract_tax_depreciation_total(report_input: ReportInput) -> float | None:
     return clean_amount(value)
 
 
+def _tax_depreciation_matches_selected_period(report_input: ReportInput) -> bool:
+    """Require an explicit selected-year marker in a schedule's title/header.
+
+    A tax depreciation schedule is period-specific evidence.  Do not reuse a
+    previous-year schedule merely because it is the only schedule uploaded.
+    """
+    preview = " ".join(
+        str(value)
+        for value in report_input.raw_df.head(6).to_numpy().ravel()
+        if not pd.isna(value)
+    )
+    return bool(re.search(rf"\b{re.escape(str(SELECTED_INCOME_YEAR))}\b", preview))
+
+
 def load_clean_report_bundle() -> CleanedReports:
     inputs = discover_report_inputs()
 
@@ -1067,15 +1240,20 @@ def load_clean_report_bundle() -> CleanedReports:
 
     tax_depreciation_total = None
     tax_depreciation_source = None
+    tax_depreciation_matches_selected_period = False
 
     if tax_dep_input is not None:
         tax_depreciation_total = extract_tax_depreciation_total(tax_dep_input)
         tax_depreciation_source = f"{tax_dep_input.source_path} :: {tax_dep_input.sheet_name}"
+        tax_depreciation_matches_selected_period = _tax_depreciation_matches_selected_period(
+            tax_dep_input
+        )
 
         logger.info(
-            "Extracted tax depreciation total=%s from %s",
+            "Extracted tax depreciation total=%s from %s matches_selected_period=%s",
             tax_depreciation_total,
             tax_depreciation_source,
+            tax_depreciation_matches_selected_period,
         )
 
     return CleanedReports(
@@ -1088,6 +1266,7 @@ def load_clean_report_bundle() -> CleanedReports:
         tax_depreciation_total=tax_depreciation_total,
         tax_depreciation_source=tax_depreciation_source,
         tax_depreciation_report=tax_dep_input,
+        tax_depreciation_matches_selected_period=tax_depreciation_matches_selected_period,
     )
 
 

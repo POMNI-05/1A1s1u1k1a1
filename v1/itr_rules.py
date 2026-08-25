@@ -18,6 +18,7 @@ Design principles:
 
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Iterable, Literal
@@ -61,6 +62,7 @@ class LabelRule:
     support_key: str = ""
     support_display_ref: str = ""
     support_label: str = ""
+    rule_id: str = ""
 
     def as_mapping(self) -> dict[str, str]:
         return {
@@ -82,7 +84,25 @@ class LabelRule:
             "Support Key": self.support_key,
             "Support Display Ref": self.support_display_ref,
             "Support Label": self.support_label,
+            "Rule ID": self.rule_id,
+            "Matched Pattern": "",
+            "Matched Text": "",
+            "Rule Source": "rule",
         }
+
+
+def _derived_rule_id(
+    patterns: Iterable[str],
+    itr_ref: str,
+    itr_label: str,
+    treatment: Treatment,
+    reason: str,
+) -> str:
+    """Build a reproducible ID from the policy content of a label rule."""
+
+    material = "\x1f".join([*patterns, itr_ref, itr_label, treatment, reason])
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
+    return f"itr-rule-{digest}"
 
 
 def R(
@@ -100,12 +120,14 @@ def R(
     support_key: str = "",
     support_display_ref: str = "",
     support_label: str = "",
+    rule_id: str = "",
 ) -> LabelRule:
+    normalised_patterns = tuple(patterns)
     if recon_itr_ref and not recon_display_ref:
         recon_display_ref = recon_itr_ref
 
     return LabelRule(
-        patterns=tuple(patterns),
+        patterns=normalised_patterns,
         itr_ref=itr_ref,
         itr_label=itr_label,
         treatment=treatment,
@@ -119,6 +141,8 @@ def R(
         support_key=support_key,
         support_display_ref=support_display_ref,
         support_label=support_label,
+        rule_id=rule_id
+        or _derived_rule_id(normalised_patterns, itr_ref, itr_label, treatment, reason),
     )
 
 
@@ -1670,13 +1694,19 @@ def _match_rules(text: str, rules: Iterable[LabelRule]) -> dict[str, str] | None
     for rule in rules:
         for pattern in rule.patterns:
             if re.search(pattern, text, flags=re.IGNORECASE):
-                return rule.as_mapping()
+                mapping = rule.as_mapping()
+                mapping["Matched Pattern"] = pattern
+                mapping["Matched Text"] = text
+                mapping["Rule Source"] = "regex"
+                return mapping
     return None
 
 
 def _with_section_reason(mapping: dict[str, str], report_section: str) -> dict[str, str]:
     result = dict(mapping)
     result["Label Reason"] = f"{result['Label Reason']} Section={report_section!r}."
+    result["Matched Text"] = report_section
+    result["Rule Source"] = "section_fallback"
     return result
 
 
@@ -1698,7 +1728,56 @@ def _unmapped(account_name: str, report_type: str, report_section: str = "") -> 
         "Support Key": "",
         "Support Display Ref": "",
         "Support Label": "",
+        "Rule ID": "unmapped",
+        "Matched Pattern": "",
+        "Matched Text": account_name,
+        "Rule Source": "unmapped",
     }
+
+
+def _section_only_review(
+    account_name: str,
+    report_type: str,
+    report_section: str,
+    suggested: LabelRule,
+) -> dict[str, str]:
+    """Keep a plausible disclosure answer, but require accountant review."""
+
+    result = suggested.as_mapping()
+    suggested_ref = str(result.get("ITR Ref", "") or "").strip()
+    suggested_label = str(result.get("ITR Label", "") or "").strip()
+    existing_note = str(result.get("Review Note", "") or "").strip()
+    result.update(
+        {
+            "Treatment": "review_only",
+            "Confidence": "low",
+            "Review Note": " ".join(
+                part
+                for part in (
+                    existing_note,
+                    "No account-name rule matched; accountant to confirm purpose and "
+                    "supporting records before relying on this disclosure suggestion.",
+                )
+                if part
+            ),
+            "Label Reason": (
+                f"No account-name rule matched account={account_name!r}; "
+                f"report section={report_section!r} suggests {suggested_ref} "
+                f"{suggested_label}. Disclosure suggestion retained for accountant review."
+            ).strip(),
+            "Recon ITR Ref": "",
+            "Recon Key": "",
+            "Recon Display Ref": "",
+            "Recon Direction": "",
+            "Support Key": "",
+            "Support Display Ref": "",
+            "Support Label": "",
+            "Matched Pattern": "",
+            "Matched Text": account_name,
+            "Rule Source": "section_fallback_review",
+        }
+    )
+    return result
 
 
 def _normalise_report_type(report_type: str) -> str:
@@ -1752,7 +1831,12 @@ def match_financial_label(
 
         fallback = SECTION_FALLBACKS["profit_and_loss"].get(section)
         if fallback:
-            return _with_section_reason(fallback.as_mapping(), report_section)
+            return _section_only_review(
+                account_name,
+                report_type,
+                report_section,
+                fallback,
+            )
 
         return _unmapped(account_name, report_type, report_section)
 

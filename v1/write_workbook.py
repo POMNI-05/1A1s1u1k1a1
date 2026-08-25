@@ -52,6 +52,9 @@ SECTION_FILL = PatternFill("solid", fgColor="FFFF00")
 REVIEW_FILL = PatternFill("solid", fgColor="FFF2CC")
 RESULT_FILL = PatternFill("solid", fgColor="D9E2F3")
 INPUT_FILL = PatternFill("solid", fgColor="E2F0D9")
+APPROVED_ADJUSTMENT_FILL = PatternFill("solid", fgColor="E2F0D9")
+APPROVED_DEDUCTION_FILL = PatternFill("solid", fgColor="D9EAF7")
+PENDING_REVIEW_FILL = PatternFill("solid", fgColor="F4CCCC")
 
 RED_FONT = Font(color="FF0000", bold=True, size=9)
 TITLE_FONT = Font(bold=True, size=9)
@@ -350,7 +353,7 @@ def _write_side_labels(
 
     header_row = max(source_start_row, min(source_rows) - 1) if source_rows else source_start_row
     headers = {
-        itr_col: "ITR Label",
+        itr_col: "ITR Ref",
         confidence_col: "Confidence",
         reason_col: "Mapping reason",
         review_col: "Review note",
@@ -425,8 +428,20 @@ def _write_tax_reconciliation_table(
     header_row = start_row + 1
 
     period_cols = [
-        col for col in display_cols if col not in {"Description", "ITR Ref", "Review note"}
+        col
+        for col in display_cols
+        if col not in {"Description", "ITR Ref", "Tax return code", "Review note"}
     ]
+    period_excel_cols = {
+        col_name: start_col + display_cols.index(col_name)
+        for col_name in period_cols
+    }
+    base_row_idx: int | None = None
+    add_heading_row_idx: int | None = None
+    add_total_row_idx: int | None = None
+    subtract_heading_row_idx: int | None = None
+    subtract_total_row_idx: int | None = None
+    result_row_idx: int | None = None
 
     for idx, col_name in enumerate(display_cols):
         display_name = col_name
@@ -442,6 +457,20 @@ def _write_tax_reconciliation_table(
 
     for r_idx, (_, row) in enumerate(df.iterrows(), start=header_row + 1):
         line_type = str(row.get("Line Type", "")).lower()
+        description = str(row.get("Description", "") or "")
+
+        if description == "Accounting profit/(loss) — Item 6T":
+            base_row_idx = r_idx
+        elif line_type == "add_heading":
+            add_heading_row_idx = r_idx
+        elif description == "Total ADD":
+            add_total_row_idx = r_idx
+        elif line_type == "subtract_heading":
+            subtract_heading_row_idx = r_idx
+        elif description == "Total SUBTRACT":
+            subtract_total_row_idx = r_idx
+        elif line_type == "result" and "Item 7T" in description:
+            result_row_idx = r_idx
 
         for c_idx, col_name in enumerate(display_cols):
             value = _safe(row[col_name])
@@ -469,9 +498,19 @@ def _write_tax_reconciliation_table(
                 ws.cell(r_idx, c).fill = SECTION_FILL
                 ws.cell(r_idx, c).font = BOLD_FONT
 
+        elif line_type in {"add_heading", "subtract_heading"}:
+            # Direction must be immediately visible without turning the whole
+            # review calculation into a coloured warning block.
+            ws.cell(r_idx, start_col).font = RED_FONT
+
         elif line_type == "placeholder":
             for c in range(start_col, last_col + 1):
                 ws.cell(r_idx, c).font = NOTE_FONT
+
+        elif line_type == "review":
+            for c in range(start_col, last_col + 1):
+                ws.cell(r_idx, c).fill = REVIEW_FILL
+            ws.cell(r_idx, start_col).font = BOLD_FONT
 
         elif line_type == "subtotal":
             for c in range(start_col, last_col + 1):
@@ -488,6 +527,33 @@ def _write_tax_reconciliation_table(
             for c in range(start_col, last_col + 1):
                 ws.cell(r_idx, c).font = NOTE_FONT
 
+    # Keep the deterministic Python calculation as the generation-time
+    # control, but make the visible Tab 3 bridge live in Excel.  An accountant
+    # can now amend an adjustment and immediately see the totals and 7T move.
+    for period, col_idx in period_excel_cols.items():
+        letter = get_column_letter(col_idx)
+
+        if add_total_row_idx is not None and add_heading_row_idx is not None:
+            ws.cell(add_total_row_idx, col_idx).value = (
+                f"=SUM({letter}{add_heading_row_idx + 1}:{letter}{add_total_row_idx - 1})"
+            )
+
+        if subtract_total_row_idx is not None and subtract_heading_row_idx is not None:
+            ws.cell(subtract_total_row_idx, col_idx).value = (
+                f"=SUM({letter}{subtract_heading_row_idx + 1}:{letter}{subtract_total_row_idx - 1})"
+            )
+
+        if result_row_idx is not None and base_row_idx is not None:
+            add_term = f"{letter}{add_total_row_idx}" if add_total_row_idx is not None else "0"
+            subtract_term = (
+                f"{letter}{subtract_total_row_idx}"
+                if subtract_total_row_idx is not None
+                else "0"
+            )
+            ws.cell(result_row_idx, col_idx).value = (
+                f"={letter}{base_row_idx}+{add_term}-{subtract_term}"
+            )
+
     for col in range(start_col, last_col + 1):
         header = str(ws.cell(header_row, col).value or "")
         letter = get_column_letter(col)
@@ -495,7 +561,7 @@ def _write_tax_reconciliation_table(
         if header == "Description":
             ws.column_dimensions[letter].width = 34
         elif header == "Review note":
-            ws.column_dimensions[letter].width = 32
+            ws.column_dimensions[letter].width = 60
         elif re.search(r"20\d{2}|30 June|30 Jun", header):
             ws.column_dimensions[letter].width = 22
         else:
@@ -543,22 +609,39 @@ def _find_main_amount_col(ws, start_row: int, last_row: int, last_col: int) -> i
 
     Usually this is column B, but this is safer than hard-coding B.
     """
-    year_matches = []
+    # A report title often contains the selected year in column A (for example
+    # "For the year ended 30 June 2025").  It is context, not an amount
+    # column.  First find the actual Account/Description header row and choose
+    # the selected period only from that same row.
+    header_rows_found = False
+    for row_idx in range(start_row, min(last_row, start_row + 12) + 1):
+        values = [ws.cell(row_idx, col_idx).value for col_idx in range(1, last_col + 1)]
+        has_account_header = any(
+            str(value or "").strip().lower()
+            in {"account", "account name", "account label", "description"}
+            for value in values
+        )
+        if not has_account_header:
+            continue
 
-    for col_idx in range(1, last_col + 1):
-        for row_idx in range(start_row, min(last_row, start_row + 12) + 1):
-            value = ws.cell(row_idx, col_idx).value
-            if value is not None and str(SELECTED_INCOME_YEAR) in str(value):
-                year_matches.append(col_idx)
-                break
+        header_rows_found = True
+        year_matches = [
+            col_idx
+            for col_idx, value in enumerate(values, start=1)
+            if value is not None and str(SELECTED_INCOME_YEAR) in str(value)
+        ]
+        if len(year_matches) == 1:
+            return year_matches[0]
+        if len(year_matches) > 1:
+            raise ValueError(
+                f"PERIOD-001: income year {SELECTED_INCOME_YEAR} appears in multiple "
+                f"amount headers: {year_matches}"
+            )
 
-    year_matches = list(dict.fromkeys(year_matches))
-    if len(year_matches) == 1:
-        return year_matches[0]
-    if len(year_matches) > 1:
+    if header_rows_found:
         raise ValueError(
-            f"PERIOD-001: income year {SELECTED_INCOME_YEAR} appears in multiple report columns: "
-            f"{year_matches}"
+            f"PERIOD-001: income year {SELECTED_INCOME_YEAR} is not present in the "
+            "Account/Description header row."
         )
 
     # A generic one-period export may omit a year header.  It is safe only
@@ -689,6 +772,72 @@ def _write_pl_formula_summary_table(
 
     return pre_tax_row, amount_out_col
 
+
+def _balance_sheet_summary_labels(labelled_df: pd.DataFrame) -> list[str]:
+    """Return the filing/support references worth showing in a compact total."""
+
+    if labelled_df is None or labelled_df.empty or "ITR Ref" not in labelled_df.columns:
+        return []
+
+    rows = labelled_df.copy()
+    if "Row Type" in rows.columns:
+        rows = rows[rows["Row Type"].astype(str).str.lower().isin({"account", "total"})]
+    if "Treatment" in rows.columns:
+        rows = rows[~rows["Treatment"].astype(str).str.lower().eq("support_only")]
+
+    refs = {
+        str(value).strip()
+        for value in rows["ITR Ref"].tolist()
+        if str(value).strip() and str(value).strip() != "Review"
+    }
+    return sorted(refs)
+
+
+def _write_balance_sheet_formula_summary_table(
+    ws,
+    start_row: int,
+    start_col: int,
+    label_col: int,
+    amount_col: int,
+    data_start_row: int,
+    data_last_row: int,
+    labelled_df: pd.DataFrame,
+) -> tuple[int, int]:
+    """Write a concise Item 8 review total beside the Balance Sheet evidence."""
+
+    title = "Balance Sheet ITR Totals"
+    labels = _balance_sheet_summary_labels(labelled_df)
+    ws.cell(start_row, start_col, title)
+    ws.cell(start_row, start_col).fill = SECTION_FILL
+    ws.cell(start_row, start_col).font = BOLD_FONT
+    ws.cell(start_row, start_col + 1, "Amount")
+    ws.cell(start_row, start_col + 1).fill = SECTION_FILL
+    ws.cell(start_row, start_col + 1).font = BOLD_FONT
+
+    if not labels:
+        ws.cell(start_row + 1, start_col, "No filing/support labels detected")
+        ws.cell(start_row + 1, start_col).font = NOTE_FONT
+        return start_row + 1, start_col + 1
+
+    label_letter = get_column_letter(label_col)
+    amount_letter = get_column_letter(amount_col)
+    label_range = f"${label_letter}${data_start_row}:${label_letter}${data_last_row}"
+    amount_range = f"${amount_letter}${data_start_row}:${amount_letter}${data_last_row}"
+
+    for row_offset, label in enumerate(labels, start=2):
+        label_cell = ws.cell(start_row + row_offset, start_col, label)
+        amount_cell = ws.cell(start_row + row_offset, start_col + 1)
+        amount_cell.value = f"=SUMIF({label_range},{label_cell.coordinate},{amount_range})"
+        amount_cell.number_format = '$#,##0.00;($#,##0.00);-'
+
+    for row_idx in range(start_row, start_row + len(labels) + 2):
+        for col_idx in range(start_col, start_col + 2):
+            ws.cell(row_idx, col_idx).fill = SECTION_FILL
+
+    ws.column_dimensions[get_column_letter(start_col)].width = 24
+    ws.column_dimensions[get_column_letter(start_col + 1)].width = 16
+    return start_row + len(labels) + 1, start_col + 1
+
 def _write_label_summary_table(
     ws,
     df: pd.DataFrame,
@@ -732,7 +881,11 @@ def _write_label_summary_table(
         for c_idx, col_name in enumerate(display_df.columns):
             value = _safe(row[col_name])
             cell = ws.cell(r_idx, start_col + c_idx, value)
-            cell.alignment = Alignment(vertical="top", wrap_text=False)
+            cell.alignment = Alignment(
+                vertical="top",
+                wrap_text=str(col_name).strip().lower()
+                in {"review note", "reason", "label reason", "detail"},
+            )
             cell.border = THIN_BORDER
 
             if col_name == "Amount" and _is_number(value):
@@ -810,7 +963,7 @@ def _write_simple_table(
         lower = str(col_name).strip().lower()
 
         if lower in {"review note", "reason", "label reason", "detail"}:
-            ws.column_dimensions[letter].width = 38
+            ws.column_dimensions[letter].width = 60
         elif lower == "check":
             ws.column_dimensions[letter].width = 32
         elif lower == "status":
@@ -862,10 +1015,15 @@ def _append_review_output(
     source_last_col = ws.max_column
     itr_col = source_last_col + 2
     confidence_col = itr_col + 1
-    reason_col = itr_col + 2
-    review_col = itr_col + 3
+    reason_col = confidence_col + 1
+    review_col = reason_col + 1
 
-    widths = {itr_col: 14, confidence_col: 12, reason_col: 38, review_col: 42}
+    widths = {
+        itr_col: 14,
+        confidence_col: 12,
+        reason_col: 44,
+        review_col: 64,
+    }
     for col_idx, width in widths.items():
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
@@ -894,12 +1052,16 @@ def _append_review_output(
             data_last_row=ws.max_row,
         )
     else:
-        _write_label_summary_table(
+        amount_col = _find_main_amount_col(ws, 1, ws.max_row, source_last_col)
+        _write_balance_sheet_formula_summary_table(
             ws,
-            label_summary,
-            "Balance Sheet ITR Summary",
             1,
             summary_col,
+            itr_col,
+            amount_col,
+            1,
+            ws.max_row,
+            labelled_df,
         )
 
     ws.freeze_panes = ws.freeze_panes or "A2"
@@ -941,7 +1103,13 @@ def _write_checks_sheet(wb: Workbook, reports, workpaper) -> None:
     periods = [
         col
         for col in workpaper.tax_reconciliation.columns
-        if col not in {"Line Type", "Description", "ITR Ref", "Review note"}
+        if col not in {
+            "Line Type",
+            "Description",
+            "ITR Ref",
+            "Tax return code",
+            "Review note",
+        }
     ]
     output_checks = pd.DataFrame(
         [
@@ -964,6 +1132,16 @@ def _write_checks_sheet(wb: Workbook, reports, workpaper) -> None:
     if workpaper.bs_checks is not None and not workpaper.bs_checks.empty:
         row, _ = _write_simple_table(ws, workpaper.bs_checks, "Balance Sheet Test Checks", row + 3, 1)
 
+    tax_reconciliation_checks = getattr(workpaper, "tax_reconciliation_review_checks", None)
+    if tax_reconciliation_checks is not None and not tax_reconciliation_checks.empty:
+        row, _ = _write_simple_table(
+            ws,
+            tax_reconciliation_checks,
+            "Tax Reconciliation Review Checks",
+            row + 3,
+            1,
+        )
+
     review_items = getattr(workpaper, "review_items", None)
     if review_items is not None and not review_items.empty:
         _write_simple_table(ws, review_items, "Review Items", row + 3, 1)
@@ -980,6 +1158,12 @@ def write_workbook(reports, workpaper) -> None:
     _append_review_output(pl_ws, workpaper.labelled_pl, workpaper.pl_label_summary, "profit_and_loss")
     _append_review_output(bs_ws, workpaper.labelled_bs, workpaper.bs_label_summary, "balance_sheet")
 
+    # Uploaded source evidence always comes first.  A supplied tax-depreciation
+    # schedule is copied before the generated calculation/review tabs so a
+    # reviewer reads source workpapers before the derived output.
+    if reports.tax_depreciation_report is not None and reports.tax_depreciation_total is not None:
+        _copy_sheet_to_workbook(reports.tax_depreciation_report, wb, "Fixed Assets")
+
     ws = wb.create_sheet(SHEET_RECONCILIATION)
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
@@ -994,8 +1178,21 @@ def write_workbook(reports, workpaper) -> None:
     ws.sheet_view.showGridLines = False
     ws.freeze_panes = "A3"
 
-    if reports.tax_depreciation_report is not None and reports.tax_depreciation_total is not None:
-        _copy_sheet_to_workbook(reports.tax_depreciation_report, wb, "Fixed Assets")
+    tax_calculation = getattr(workpaper, "tax_calculation", None)
+    if tax_calculation is not None and not tax_calculation.empty:
+        tax_ws = wb.create_sheet("Tax Calculation")
+        tax_ws.sheet_view.showGridLines = False
+        tax_ws.freeze_panes = "A3"
+        _, calculation_last_col = _write_tax_reconciliation_table(
+            tax_ws,
+            tax_calculation,
+            "Company Tax Calculation — outside Item 7",
+            1,
+            1,
+        )
+        _format_sheet(tax_ws, calculation_last_col)
+        tax_ws.sheet_view.showGridLines = False
+        tax_ws.freeze_panes = "A3"
 
     _write_inputs_sheet(wb, workpaper)
     _write_checks_sheet(wb, reports, workpaper)

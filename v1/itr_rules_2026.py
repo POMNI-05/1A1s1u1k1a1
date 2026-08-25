@@ -35,6 +35,7 @@ try:
         SECTION_FALLBACKS,
         _normalise_rule_text,
         _match_rules,
+        _section_only_review,
         _with_section_reason,
         _unmapped,
         _normalise_report_type,
@@ -59,6 +60,7 @@ except ImportError:
         SECTION_FALLBACKS,
         _normalise_rule_text,
         _match_rules,
+        _section_only_review,
         _with_section_reason,
         _unmapped,
         _normalise_report_type,
@@ -604,7 +606,12 @@ def match_financial_label(
 
         fallback = SECTION_FALLBACKS["profit_and_loss"].get(section)
         if fallback:
-            mapped = _with_section_reason(fallback.as_mapping(), report_section)
+            mapped = _section_only_review(
+                account_name,
+                report_type,
+                report_section,
+                fallback,
+            )
             return _post_adjust_2026_mapping(
                 mapped,
                 text=text,

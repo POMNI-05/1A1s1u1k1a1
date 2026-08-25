@@ -87,7 +87,6 @@ SELECTED_INCOME_YEAR = os.getenv(
     os.getenv("ATO_POLICY_YEAR", "2026"),
 )
 
-INCLUDE_RD_TABLE = os.getenv("INCLUDE_RD_TABLE", "true").lower() == "true"
 INCLUDE_CARRY_LOSS_TABLE = os.getenv("INCLUDE_CARRY_LOSS_TABLE", "true").lower() == "true"
 INCLUDE_TAX_DEPRECIATION_REVIEW = (
     os.getenv("INCLUDE_TAX_DEPRECIATION_REVIEW", "true").lower() == "true"
@@ -165,17 +164,6 @@ INSTANT_ASSET_WRITEOFF_LIMIT = SELECTED_ATO_POLICY[
     "small_business_thresholds"
 ]["instant_asset_writeoff"]
 
-RD_ELIGIBLE = os.getenv("RD_ELIGIBLE", "false").lower() == "true"
-RD_REFUNDABLE = os.getenv("RD_REFUNDABLE", "true").lower() == "true"
-RD_PREMIUMS = SELECTED_ATO_POLICY["rd_offset_rates"]
-# A refundable R&D rate is the selected company rate plus 18.5 percentage
-# points. A non-refundable claim is intensity-tiered, so no single safe rate
-# exists without additional inputs.
-RD_OFFSET_RATE = (
-    TAX_RATE + RD_PREMIUMS["refundable_premium"]
-    if RD_ELIGIBLE and RD_REFUNDABLE and TAX_RATE is not None
-    else None
-)
 
 # ---------------------------------------------------------------------------
 # 6. Reviewed tax reconciliation inputs
@@ -224,15 +212,9 @@ RD_BREAKDOWN_TEMPLATE = [
     {"Description": "Reduction in Software Development Pool", "Amount": None},
 ]
 
-RD_OFFSET_AMOUNT = None
-
 # ---------------------------------------------------------------------------
 # 8. Safe tax depreciation handling
 # ---------------------------------------------------------------------------
-# Default:
-# - extract tax depreciation total as support;
-# - do not automatically post it to taxable income unless reviewed/enabled.
-
-AUTO_POST_TAX_DEPRECIATION_TO_7F = (
-    os.getenv("AUTO_POST_TAX_DEPRECIATION_TO_7F", "false").lower() == "true"
-)
+# A detected schedule is evidence only.  The per-job reviewed total and its
+# explicit accountant approval live in job_config.json; only that approved
+# input can post to Item 7F.

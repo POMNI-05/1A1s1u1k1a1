@@ -13,34 +13,33 @@ import pandas as pd
 try:
     from .cleaner import CleanedReports, load_clean_report_bundle, clean_amount
     from .config import (
-        AUTO_POST_TAX_DEPRECIATION_TO_7F,
         COMPANY_TAX_RATE_CATEGORY,
         RD_BREAKDOWN_TEMPLATE,
-        RD_OFFSET_AMOUNT,
         SELECTED_ATO_POLICY,
         SELECTED_INCOME_YEAR,
         TAX_ADJUSTMENTS,
         TAX_RATE,
     )
     from .itr_metadata import WORKSHEET_2, validate_adjustment_label, get_item7_direction
-    from .job_config import table_requested
+    from .job_config import load_job_config, table_requested
     from .labeller import label_report, extract_review_items
+    from .decision_trace import build_decision_traces, review_items_from_traces
 except ImportError:  # Direct-script compatibility.
     from cleaner import CleanedReports, load_clean_report_bundle, clean_amount
     from config import (
-        AUTO_POST_TAX_DEPRECIATION_TO_7F,
         COMPANY_TAX_RATE_CATEGORY,
         RD_BREAKDOWN_TEMPLATE,
-        RD_OFFSET_AMOUNT,
         SELECTED_ATO_POLICY,
         SELECTED_INCOME_YEAR,
         TAX_ADJUSTMENTS,
         TAX_RATE,
     )
     from itr_metadata import WORKSHEET_2, validate_adjustment_label, get_item7_direction
-    from job_config import table_requested
+    from job_config import load_job_config, table_requested
     from labeller import label_report, extract_review_items
+    from decision_trace import build_decision_traces, review_items_from_traces
 
+from ai_review import DecisionTrace, ReviewItem
 from tax_calculators.company_tax import calculate_company_tax
 
 logger = logging.getLogger(__name__)
@@ -54,12 +53,16 @@ class Workpaper:
     bs_label_summary: pd.DataFrame
 
     tax_reconciliation: pd.DataFrame
+    tax_reconciliation_review_checks: pd.DataFrame
+    tax_calculation: pd.DataFrame
     carry_forward_losses: pd.DataFrame
     rd_breakdown: pd.DataFrame
     bs_checks: pd.DataFrame
     review_items: pd.DataFrame
     proposed_adjustments: pd.DataFrame
     support_tables: dict[str, pd.DataFrame]
+    decision_traces: tuple[DecisionTrace, ...]
+    deterministic_review_items: tuple[ReviewItem, ...]
 
 
 SUPPORT_TABLE_TEMPLATES: dict[str, tuple[str, list[dict[str, Any]]]] = {
@@ -131,6 +134,9 @@ def _detect_amount_cols(df: pd.DataFrame) -> list[str]:
         lower = str(col).strip().lower()
 
         if lower in helper_cols:
+            continue
+
+        if lower.endswith(" parse status"):
             continue
 
         if lower in {"account", "account name", "description"}:
@@ -205,6 +211,14 @@ def _build_label_summary(
 
     if rows.empty:
         return pd.DataFrame(columns=columns)
+
+    # Rule packs currently expose the authoritative ITR label, rather than a
+    # separate Workpaper Label field.  Older summary code created a blank
+    # Workpaper Label column then filtered every row out, producing "No labels
+    # detected" beside visible 8G/8H side labels.  Derive the display label
+    # from ITR Label when a pack has not provided a distinct workpaper label.
+    if "Workpaper Label" not in rows.columns:
+        rows["Workpaper Label"] = rows.get("ITR Label", "")
 
     for col in [
         "Workpaper Label",
@@ -557,6 +571,73 @@ def _auto_reconciliation_rows_from_labelled_pl(
     return add_rows, subtract_rows, total_add_backs, total_subtractions
 
 
+def _unapproved_reconciliation_rows_from_labelled_pl(
+    labelled_pl: pd.DataFrame,
+    periods: list[str],
+) -> list[dict]:
+    """Return visible Item 7 candidates that are deliberately excluded.
+
+    A reconciliation with unresolved adjustments remains preliminary. The
+    source-backed candidates are included in the preliminary calculation so a
+    reviewer has a usable starting number, but remain separately marked for
+    accountant approval before a lodged tax-return value is finalised.
+    """
+
+    if labelled_pl is None or labelled_pl.empty:
+        return []
+
+    account_col = _get_account_col(labelled_pl)
+    rows = labelled_pl[
+        labelled_pl.get("Row Type", "").astype(str).str.lower().eq("account")
+    ].copy()
+    candidates: list[dict] = []
+
+    for _, row in rows.iterrows():
+        recon_ref = str(
+            row.get("Recon Display Ref", "")
+            or row.get("Recon ITR Ref", "")
+            or ""
+        ).strip()
+        direction = str(row.get("Recon Direction", "") or "").strip().lower()
+        auto_post = str(row.get("Auto Post", "") or "").strip().lower()
+
+        if (
+            not recon_ref
+            or direction not in {"add", "subtract"}
+            or auto_post in {"yes", "true", "1", "approved"}
+        ):
+            continue
+
+        validate_adjustment_label(recon_ref, str(row.get(account_col, "")))
+        output_row = {
+            "Line Type": f"review_{direction}",
+            # Keep the calculation face short.  Proposal/approval evidence is
+            # retained in the review note and Inputs & Overrides, not repeated
+            # in every Tab 3 account description.
+            "Description": str(row.get(account_col, "") or "").strip(),
+            "ITR Ref": recon_ref,
+            "Review note": (
+                f"Included in preliminary calculation only; accountant approval "
+                f"required before final lodgment. "
+                f"{str(row.get('Review Note', '') or '').strip()}"
+            ).strip(),
+            # Internal calculation evidence.  This field is deliberately not
+            # rendered in the workpaper; the visible description remains the
+            # accountant-facing explanation.
+            "_Scenario direction": direction,
+        }
+        has_amount = False
+        for period in periods:
+            amount = clean_amount(row.get(period, 0.0))
+            output_row[period] = amount
+            has_amount = has_amount or abs(amount) > 0.005
+
+        if has_amount:
+            candidates.append(output_row)
+
+    return candidates
+
+
 def _build_proposed_adjustments(
     labelled_pl: pd.DataFrame,
     periods: list[str],
@@ -613,21 +694,18 @@ def _build_proposed_adjustments(
 
 def _tax_depreciation_reconciliation_rows(
     periods: list[str],
-    tax_depreciation_total: float | None,
-    tax_depreciation_source: str | None,
+    reviewed_tax_depreciation_total: float | None,
+    approved_for_posting: bool,
 ) -> tuple[list[dict], dict[str, float]]:
-    """Optionally post extracted tax depreciation to 7F.
-
-    Safe default is controlled by AUTO_POST_TAX_DEPRECIATION_TO_7F=False.
-    When enabled, this posts the amount to the uniquely requested period.
-    """
+    """Post only an explicitly approved accountant-entered tax deduction to 7F."""
     rows: list[dict] = []
     total_subtractions = {period: 0.0 for period in periods}
 
-    if not AUTO_POST_TAX_DEPRECIATION_TO_7F:
-        return rows, total_subtractions
-
-    if tax_depreciation_total is None or abs(tax_depreciation_total) < 0.005:
+    if (
+        reviewed_tax_depreciation_total is None
+        or not approved_for_posting
+        or abs(reviewed_tax_depreciation_total) < 0.005
+    ):
         return rows, total_subtractions
 
     if not periods:
@@ -639,7 +717,7 @@ def _tax_depreciation_reconciliation_rows(
         "Line Type": "detail",
         "Description": "Tax depreciation / decline in value",
         "ITR Ref": "7F",
-        "Review note": f"Auto-posted from tax depreciation support schedule: {tax_depreciation_source or 'source not recorded'}",
+        "Review note": "Posted from an explicitly accountant-approved 7F input.",
     }
 
     requested_period = _requested_period(periods)
@@ -650,7 +728,7 @@ def _tax_depreciation_reconciliation_rows(
         return rows, total_subtractions
 
     for period in periods:
-        amount = float(tax_depreciation_total) if period == requested_period else 0.0
+        amount = float(reviewed_tax_depreciation_total) if period == requested_period else 0.0
         row[period] = amount
         total_subtractions[period] += amount
 
@@ -658,11 +736,179 @@ def _tax_depreciation_reconciliation_rows(
     return rows, total_subtractions
 
 
+def _detected_tax_depreciation_schedule_rows(
+    periods: list[str],
+    tax_depreciation_total: float | None,
+    tax_depreciation_source: str | None,
+    matches_selected_period: bool,
+) -> list[dict]:
+    """Return a matching tax-law schedule as a preliminary Item 7F deduction."""
+    if (
+        tax_depreciation_total is None
+        or abs(float(tax_depreciation_total)) < 0.005
+        or not matches_selected_period
+        or not periods
+    ):
+        return []
+
+    requested_period = _requested_period(periods)
+    if requested_period is None:
+        return []
+
+    validate_adjustment_label("7F", "Tax depreciation / decline in value")
+    row = {
+        "Line Type": "detail",
+        "Description": "Tax depreciation / decline in value",
+        "ITR Ref": "7F",
+        "Review note": (
+            "Included in preliminary calculation from the detected tax-law "
+            "depreciation schedule; accountant review may revise it before lodgment. "
+            f"Source: {tax_depreciation_source or 'tax depreciation schedule'}"
+        ),
+        "_Scenario direction": "subtract",
+    }
+    for period in periods:
+        row[period] = float(tax_depreciation_total) if period == requested_period else 0.0
+    return [row]
+
+
+def _reconciliation_completeness_rows(
+    labelled_pl: pd.DataFrame,
+    net_profit_methods: dict[str, str],
+) -> tuple[list[dict], bool]:
+    """Return evidence checks that explain whether Item 7T is final.
+
+    These are review prompts, not inferred tax adjustments.  A detected
+    account-name trigger requires accountant evidence before the Item 7 result
+    can be treated as final; no source trigger is recorded as informational.
+    """
+
+    rows: list[dict] = []
+    base_requires_review = any(
+        "before tax" not in str(method).lower()
+        for method in net_profit_methods.values()
+    )
+    base_method = "; ".join(sorted(set(net_profit_methods.values())))
+    rows.append(
+        {
+            "Line Type": "review" if base_requires_review else "note",
+            "Description": (
+                "Item 6T base: confirm Net Profit excludes income tax expense"
+                if base_requires_review
+                else "Item 6T base: explicit profit before tax source"
+            ),
+            "ITR Ref": "6T",
+            "Review note": base_method,
+        }
+    )
+
+    names = ""
+    if labelled_pl is not None and not labelled_pl.empty:
+        account_col = _get_account_col(labelled_pl)
+        names = " ".join(
+            str(value or "").lower() for value in labelled_pl[account_col].tolist()
+        )
+
+    triggers = [
+        (
+            "CGT / asset-disposal check",
+            r"capital gain|capital loss|disposal|sale of asset|balancing adjustment",
+            "Check Item 7A, 7B, 7Q, 7W or 7X and any required CGT support.",
+        ),
+        (
+            "Depreciation / capital-allowance check",
+            r"depreciat|amortis|capital works|project pool|decline in value",
+            "Check accounting depreciation add-back and reviewed Item 7F/7H/7I deductions.",
+        ),
+        (
+            "Foreign income / TOFA check",
+            r"foreign|forex|exchange gain|exchange loss|tofa",
+            "Check the relevant Item 7B, 7E, 7Q, 7W or 7X treatment.",
+        ),
+        (
+            "Tax-loss check",
+            r"tax loss|prior year loss|carry.?forward loss",
+            "Check eligibility and any Item 7R deduction before posting.",
+        ),
+        (
+            "R&D check",
+            r"research|r&d|rnd|development",
+            "Check whether an R&D schedule/Item 7D and Item 21 claim are actually required.",
+        ),
+    ]
+
+    triggered_count = 0
+    for description, pattern, note in triggers:
+        triggered = bool(re.search(pattern, names, flags=re.IGNORECASE))
+        triggered_count += int(triggered)
+        rows.append(
+            {
+                "Line Type": "review" if triggered else "note",
+                "Description": (
+                    f"{description}: REVIEW REQUIRED"
+                    if triggered
+                    else f"{description}: no source trigger detected"
+                ),
+                "ITR Ref": "",
+                "Review note": note,
+            }
+        )
+
+    return rows, base_requires_review or bool(triggered_count)
+
+
+def _company_tax_precalculation_rows(
+    periods: list[str],
+    taxable_income: dict[str, float],
+    includes_review_required_adjustments: bool,
+) -> list[dict]:
+    """Return company-tax pre-calculation rows for the Tab 3 workpaper.
+
+    The calculation is deliberately on the reconciliation tab: it is the next
+    step in the same review workflow, not a second source of truth.  Pending
+    adjustments remain visible as review items, but do not suppress a useful
+    pre-calculation.
+    """
+
+    if TAX_RATE is None:
+        return []
+
+    requested_period = _requested_period(periods)
+    tax_row = {
+        "Line Type": "result",
+        "Description": f"Indicative company tax before offsets — rate {TAX_RATE:.0%}",
+        "ITR Ref": "",
+        "Review note": (
+            "Pre-calculation includes review-required adjustments; accountant review may change the final amount."
+            if includes_review_required_adjustments
+            else "Calculation statement support only; offsets, credits and instalments are excluded."
+        ),
+    }
+    for period in periods:
+        taxable_amount = max(clean_amount(taxable_income[period]), 0.0)
+        if period != requested_period:
+            tax_row[period] = None
+            continue
+        result = calculate_company_tax(
+            SELECTED_INCOME_YEAR,
+            taxable_income=str(taxable_amount),
+            rate_category=COMPANY_TAX_RATE_CATEGORY,
+            base_rate_eligibility_confirmed=(
+                COMPANY_TAX_RATE_CATEGORY == "base_rate_entity"
+            ),
+        )
+        tax_row[period] = float(result.gross_tax)
+    return [tax_row]
+
+
 def _build_tax_reconciliation(
     clean_pl_df: pd.DataFrame,
     labelled_pl: pd.DataFrame,
     tax_depreciation_total: float | None = None,
     tax_depreciation_source: str | None = None,
+    tax_depreciation_matches_selected_period: bool = False,
+    reviewed_tax_depreciation_total: float | None = None,
+    tax_depreciation_approved_for_posting: bool = False,
 ) -> pd.DataFrame:
     net_profit_by_period, net_profit_methods = _extract_net_profit_by_period(clean_pl_df)
     periods = list(net_profit_by_period.keys())
@@ -671,7 +917,7 @@ def _build_tax_reconciliation(
 
     base_row = {
         "Line Type": "result",
-        "Description": "Accounting Profit Before Tax",
+        "Description": "Accounting profit/(loss) — Item 6T",
         "ITR Ref": "6T",
         "Review note": "",
     }
@@ -690,12 +936,31 @@ def _build_tax_reconciliation(
 
     tax_dep_rows, tax_dep_subtract_totals = _tax_depreciation_reconciliation_rows(
         periods,
-        tax_depreciation_total,
-        tax_depreciation_source,
+        reviewed_tax_depreciation_total,
+        tax_depreciation_approved_for_posting,
     )
 
     add_rows = auto_add_rows + manual_add_rows
     subtract_rows = auto_subtract_rows + manual_subtract_rows + tax_dep_rows
+    unapproved_rows = _unapproved_reconciliation_rows_from_labelled_pl(
+        labelled_pl,
+        periods,
+    )
+    # An approved accountant amount is authoritative and must not be counted
+    # again as detected schedule evidence.  Otherwise a matching tax-law
+    # schedule is useful preliminary 7F evidence for the later review.
+    if not (
+        reviewed_tax_depreciation_total is not None
+        and tax_depreciation_approved_for_posting
+    ):
+        unapproved_rows.extend(
+            _detected_tax_depreciation_schedule_rows(
+                periods,
+                tax_depreciation_total,
+                tax_depreciation_source,
+                tax_depreciation_matches_selected_period,
+            )
+        )
 
     total_add_backs = {
         period: auto_add_totals[period] + manual_add_totals[period]
@@ -716,177 +981,135 @@ def _build_tax_reconciliation(
         for period in periods
     }
 
-    rows.append(_blank_periods({
-        "Line Type": "heading",
-        "Description": "Add back",
-        "ITR Ref": "",
-        "Review note": "",
-    }, periods))
+    scenario_taxable_income = dict(taxable_income)
+    preliminary_add_backs = dict(total_add_backs)
+    preliminary_subtractions = dict(total_subtractions)
+    for pending_row in unapproved_rows:
+        direction = pending_row.get("_Scenario direction")
+        for period in periods:
+            amount = clean_amount(pending_row.get(period, 0.0))
+            if direction == "add":
+                scenario_taxable_income[period] += amount
+                preliminary_add_backs[period] += amount
+            elif direction == "subtract":
+                scenario_taxable_income[period] -= amount
+                preliminary_subtractions[period] += amount
 
-    if add_rows:
-        rows.extend(add_rows)
-    else:
+    # Tab 3 is a short calculation bridge.  Approved and review-required
+    # proposals both feed the preliminary number, while each row's review note
+    # remains the audit evidence for the later accountant review.
+    review_add_rows = [
+        row for row in unapproved_rows if row.get("_Scenario direction") == "add"
+    ]
+    review_subtract_rows = [
+        row for row in unapproved_rows if row.get("_Scenario direction") == "subtract"
+    ]
+    for row in review_add_rows + review_subtract_rows:
+        row["Line Type"] = "detail"
+
+    if add_rows or review_add_rows:
         rows.append(_blank_periods({
-            "Line Type": "placeholder",
-            "Description": "No add-back entries identified",
+            "Line Type": "add_heading",
+            "Description": "ADD",
             "ITR Ref": "",
-            "Review note": "Add rules via Recon ITR Ref or TAX_ADJUSTMENTS.",
+            "Review note": "Add these amounts to accounting profit/(loss).",
         }, periods))
+        rows.extend(add_rows + review_add_rows)
+        total_add_row = {
+            "Line Type": "subtotal",
+            "Description": "Total ADD",
+            "ITR Ref": "",
+            "Review note": "",
+        }
+        for period in periods:
+            total_add_row[period] = preliminary_add_backs[period]
+        rows.append(total_add_row)
 
-    total_add_back_row = {
-        "Line Type": "subtotal",
-        "Description": "Total add backs",
-        "ITR Ref": "",
-        "Review note": "",
-    }
-
-    for period in periods:
-        total_add_back_row[period] = total_add_backs[period]
-
-    rows.append(total_add_back_row)
-
-    rows.append(_blank_periods({
-        "Line Type": "heading",
-        "Description": "Subtract",
-        "ITR Ref": "",
-        "Review note": "",
-    }, periods))
-
-    if subtract_rows:
-        rows.extend(subtract_rows)
-    else:
+    if subtract_rows or review_subtract_rows:
         rows.append(_blank_periods({
-            "Line Type": "placeholder",
-            "Description": "No subtraction entries identified",
+            "Line Type": "subtract_heading",
+            "Description": "SUBTRACT",
             "ITR Ref": "",
-            "Review note": "Add rules via Recon ITR Ref or TAX_ADJUSTMENTS.",
+            "Review note": "Subtract these amounts from accounting profit/(loss).",
         }, periods))
+        rows.extend(subtract_rows + review_subtract_rows)
+        total_subtract_row = {
+            "Line Type": "subtotal",
+            "Description": "Total SUBTRACT",
+            "ITR Ref": "",
+            "Review note": "",
+        }
+        for period in periods:
+            total_subtract_row[period] = preliminary_subtractions[period]
+        rows.append(total_subtract_row)
 
-    total_subtract_row = {
-        "Line Type": "subtotal",
-        "Description": "Total subtractions",
-        "ITR Ref": "",
-        "Review note": "",
-    }
+    completeness_rows, completeness_requires_review = _reconciliation_completeness_rows(
+        labelled_pl,
+        net_profit_methods,
+    )
+    is_preliminary = bool(unapproved_rows) or completeness_requires_review
 
-    for period in periods:
-        total_subtract_row[period] = total_subtractions[period]
-
-    rows.append(total_subtract_row)
-
+    preliminary_taxable_income = (
+        scenario_taxable_income if unapproved_rows else taxable_income
+    )
     taxable_row = {
         "Line Type": "result",
-        "Description": "Taxable Income",
-        "ITR Ref": "7T",
-        "Review note": "",
+        "Description": (
+            "Preliminary taxable income/(loss) — Item 7T"
+            if unapproved_rows
+            else "Preliminary taxable income/(loss) — review required"
+            if completeness_requires_review
+            else "Taxable/net income or loss — Item 7T"
+        ),
+        "ITR Ref": "7T (preliminary)" if is_preliminary else "7T",
+        "Review note": (
+            "Pre-calculation only: accountant review may revise this before the final lodged Item 7T."
+            if is_preliminary
+            else ""
+        ),
+        "Tax return code": (
+            "L (preliminary)" if is_preliminary else "L"
+        ) if (
+            _requested_period(periods) is not None
+            and preliminary_taxable_income[_requested_period(periods)] < 0
+        ) else "",
     }
 
     for period in periods:
-        taxable_row[period] = taxable_income[period]
+        taxable_row[period] = preliminary_taxable_income[period]
 
     rows.append(taxable_row)
 
-    requested_period = _requested_period(periods)
-    tax_rate_label = f"{TAX_RATE:.0%}" if TAX_RATE is not None else "review required"
-    tax_row = {
-        "Line Type": "detail",
-        "Description": f"Indicative tax on taxable income - rate {tax_rate_label}",
-        "ITR Ref": "",
-        "Review note": (
-            "Tax is calculated only for the requested income year. Other source periods "
-            "are intentionally blank."
-            if TAX_RATE is not None
-            else "Select and confirm the company tax rate before relying on tax payable."
-        ),
-    }
-
-    tax_payable_by_period = {}
-
-    for period in periods:
-        taxable_amount = max(taxable_income[period], 0.0)
-        if TAX_RATE is None or period != requested_period:
-            tax_payable = None
-        else:
-            tax_result = calculate_company_tax(
-                SELECTED_INCOME_YEAR,
-                taxable_income=str(taxable_amount),
-                rate_category=COMPANY_TAX_RATE_CATEGORY,
-                base_rate_eligibility_confirmed=(
-                    COMPANY_TAX_RATE_CATEGORY == "base_rate_entity"
-                ),
-            )
-            tax_payable = float(tax_result.gross_tax)
-        tax_payable_by_period[period] = tax_payable
-        tax_row[period] = tax_payable
-
-    rows.append(tax_row)
-
-    rd_offset_row = {
-        "Line Type": "detail",
-        "Description": "R&D offset",
-        "ITR Ref": "",
-        "Review note": "Manual input only.",
-    }
-
-    final_tax_row = {
-        "Line Type": "result",
-        "Description": "Indicative tax after entered R&D offset",
-        "ITR Ref": "",
-        "Review note": (
-            "Does not include all tax offsets, credits, instalments or "
-            "special-rate calculations."
-        ),
-    }
-
-    for period in periods:
-        tax_payable = tax_payable_by_period[period]
-
-        if tax_payable is None:
-            rd_offset_row[period] = RD_OFFSET_AMOUNT
-            final_tax_row[period] = None
-        elif RD_OFFSET_AMOUNT is None:
-            rd_offset_row[period] = None
-            final_tax_row[period] = tax_payable
-        else:
-            rd_offset_row[period] = RD_OFFSET_AMOUNT
-            final_tax_row[period] = tax_payable - RD_OFFSET_AMOUNT
-
-    rows.append(rd_offset_row)
-    rows.append(final_tax_row)
-
-    method_row = {
-        "Line Type": "note",
-        "Description": "Accounting profit extraction note",
-        "ITR Ref": "",
-        "Review note": "",
-    }
-
-    for period in periods:
-        method_row[period] = net_profit_methods.get(period, "")
-
-    rows.append(method_row)
-
-    source_registry = SELECTED_ATO_POLICY["source_registry"]
-    policy_row = _blank_periods(
-        {
-            "Line Type": "note",
-            "Description": (
-                f"ATO rule pack {SELECTED_INCOME_YEAR} "
-                f"(verified {source_registry['verified_on']})"
-            ),
-            "ITR Ref": "",
-            "Review note": (
-                "Rates and thresholds loaded from the versioned rule registry; "
-                "review client eligibility and judgment-dependent treatments."
-            ),
-        },
-        periods,
-    )
-    rows.append(policy_row)
-
-    ordered_cols = ["Line Type", "Description"] + periods + ["ITR Ref", "Review note"]
+    ordered_cols = [
+        "Line Type",
+        "Description",
+        *periods,
+        "ITR Ref",
+        "Tax return code",
+        "Review note",
+    ]
 
     return pd.DataFrame(rows)[ordered_cols]
+
+
+def _build_tax_reconciliation_review_checks(
+    clean_pl_df: pd.DataFrame,
+    labelled_pl: pd.DataFrame,
+) -> pd.DataFrame:
+    """Keep fact-triggered Item 7 review checks out of the calculation bridge."""
+
+    _, net_profit_methods = _extract_net_profit_by_period(clean_pl_df)
+    rows, _ = _reconciliation_completeness_rows(labelled_pl, net_profit_methods)
+    review_rows = [row for row in rows if row.get("Line Type") == "review"]
+    return pd.DataFrame([
+        {
+            "Check": row["Description"],
+            "Status": "REVIEW REQUIRED",
+            "ITR Ref": row.get("ITR Ref", ""),
+            "Detail": row.get("Review note", ""),
+        }
+        for row in review_rows
+    ])
 
 
 def _build_carry_forward_losses_input(periods: list[str]) -> pd.DataFrame:
@@ -996,12 +1219,22 @@ def _build_tax_depreciation_review_item(reports: CleanedReports) -> pd.DataFrame
     if reports.tax_depreciation_total is None:
         return pd.DataFrame()
 
-    if AUTO_POST_TAX_DEPRECIATION_TO_7F:
-        note = "Tax depreciation was auto-posted to 7F because AUTO_POST_TAX_DEPRECIATION_TO_7F=True."
-        recon_ref = "7F"
+    if reports.tax_depreciation_matches_selected_period and abs(reports.tax_depreciation_total) >= 0.005:
+        note = (
+            "Matching tax-law depreciation schedule detected. Its total is included "
+            "in preliminary Item 7F and remains subject to accountant review."
+        )
+    elif not reports.tax_depreciation_matches_selected_period:
+        note = (
+            "Tax depreciation schedule detected for a different income year; it is "
+            "support evidence only and is not used in the selected-year Item 7F."
+        )
     else:
-        note = "Tax depreciation schedule detected. Review whether this should be claimed at 7F."
-        recon_ref = ""
+        note = (
+            "Tax depreciation schedule detected, but its extracted total is zero; "
+            "it is support evidence only and is not used in preliminary Item 7F."
+        )
+    recon_ref = ""
 
     return pd.DataFrame([
         {
@@ -1033,8 +1266,32 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
     clean_pl_df = reports.clean_pl
     clean_bs_df = reports.clean_bs
 
+    depreciation_input = (load_job_config().get("reviewed_tax_depreciation") or {})
+    reviewed_tax_depreciation_total = None
+    if table_requested("depreciation") and depreciation_input.get("amount") is not None:
+        reviewed_tax_depreciation_total = clean_amount(depreciation_input["amount"])
+        if reviewed_tax_depreciation_total < 0:
+            raise ValueError("DEPR-003: reviewed tax depreciation must not be negative")
+    tax_depreciation_approved_for_posting = bool(
+        table_requested("depreciation")
+        and depreciation_input.get("approved_for_posting") is True
+    )
+
     labelled_pl = label_report(clean_pl_df, "profit_and_loss")
     labelled_bs = label_report(clean_bs_df, "balance_sheet")
+    decision_traces = (
+        *build_decision_traces(
+            labelled_pl,
+            report_type="profit_and_loss",
+            income_year=SELECTED_INCOME_YEAR,
+        ),
+        *build_decision_traces(
+            labelled_bs,
+            report_type="balance_sheet",
+            income_year=SELECTED_INCOME_YEAR,
+        ),
+    )
+    deterministic_review_items = review_items_from_traces(decision_traces)
 
     pl_label_summary = _build_label_summary(
         labelled_pl,
@@ -1053,7 +1310,17 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
         labelled_pl,
         tax_depreciation_total=reports.tax_depreciation_total,
         tax_depreciation_source=reports.tax_depreciation_source,
+        tax_depreciation_matches_selected_period=reports.tax_depreciation_matches_selected_period,
+        reviewed_tax_depreciation_total=reviewed_tax_depreciation_total,
+        tax_depreciation_approved_for_posting=tax_depreciation_approved_for_posting,
     )
+    tax_reconciliation_review_checks = _build_tax_reconciliation_review_checks(
+        clean_pl_df,
+        labelled_pl,
+    )
+    # Company-tax pre-calculation is part of Tab 3.  Keep this empty legacy
+    # payload so the writer does not create a duplicate Tax Calculation sheet.
+    tax_calculation = pd.DataFrame()
 
     bs_checks = _build_bs_checks(clean_bs_df)
 
@@ -1075,6 +1342,14 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
         for key, (title, rows) in SUPPORT_TABLE_TEMPLATES.items()
         if table_requested(key)
     }
+    depreciation_table = support_tables.get("Tax Depreciation / Capital Allowances")
+    if depreciation_table is not None and not depreciation_table.empty:
+        depreciation_table.loc[0, "Amount"] = reviewed_tax_depreciation_total
+        depreciation_table.loc[0, "Review note"] = (
+            "Approved for posting at 7F."
+            if tax_depreciation_approved_for_posting
+            else "Enter/confirm the reviewed deduction and obtain accountant approval before posting at 7F."
+        )
 
     proposed_adjustments = _build_proposed_adjustments(labelled_pl, periods)
 
@@ -1107,10 +1382,14 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
         pl_label_summary=pl_label_summary,
         bs_label_summary=bs_label_summary,
         tax_reconciliation=tax_reconciliation,
+        tax_reconciliation_review_checks=tax_reconciliation_review_checks,
+        tax_calculation=tax_calculation,
         carry_forward_losses=carry_forward_losses,
         rd_breakdown=rd_breakdown,
         bs_checks=bs_checks,
         review_items=review_items,
         proposed_adjustments=proposed_adjustments,
         support_tables=support_tables,
+        decision_traces=decision_traces,
+        deterministic_review_items=deterministic_review_items,
     )

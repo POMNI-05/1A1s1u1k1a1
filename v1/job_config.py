@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from tax_calculators.registry import normalise_income_year
+
 
 DEFAULT_JOB_CONFIG = {
     "ato_policy_year": "2026",
@@ -28,6 +30,10 @@ DEFAULT_JOB_CONFIG = {
     "client_name": "",
     "company_tax_rate_category": "review_required",
     "base_rate_entity_assessment": {},
+    "reviewed_tax_depreciation": {
+        "amount": None,
+        "approved_for_posting": False,
+    },
     "retain_job_files": False,
 }
 
@@ -45,6 +51,11 @@ def load_job_config() -> dict[str, Any]:
     if path.exists():
         try:
             loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict) and "job_options" in loaded:
+                loaded = loaded["job_options"]
+
+            if not isinstance(loaded, dict):
+                raise ValueError("Job configuration must be an object")
 
             for key, value in loaded.items():
                 if key == "requested_tables" and isinstance(value, dict):
@@ -67,11 +78,7 @@ def load_job_config() -> dict[str, Any]:
 def get_policy_year(default: str = "2026") -> str:
     config = load_job_config()
     year = str(config.get("ato_policy_year") or config.get("itr_policy_year") or default)
-
-    if year not in {"2024", "2025", "2026"}:
-        return default
-
-    return year
+    return normalise_income_year(year)
 
 
 def table_requested(table_key: str) -> bool:

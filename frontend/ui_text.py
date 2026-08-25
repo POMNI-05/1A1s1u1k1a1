@@ -10,8 +10,8 @@ APP_SUBTITLE = "ICGTAX Partners · Automated Tax Reconciliation"
 
 # ── Section headers ───────────────────────────────────────────────────────────
 SECTION_FILES = "1  Upload files"
-SECTION_PROFILE = "2  Client profile"
-SECTION_DESCRIBE = "3  Document description"
+SECTION_PROFILE = "Engagement context"
+SECTION_DESCRIBE = "Workpaper context"
 SECTION_RESULT = "Result"
 SECTION_REVISE = "Questions & revision requests"
 SECTION_DEBUG = "Run details"
@@ -115,6 +115,81 @@ ADMIN_NOT_IMPL = "ATO metadata editor coming soon. Edit itr_metadata.py and itr_
 ERROR_NO_FILES = "Please upload at least one Excel workbook before generating."
 ERROR_PIPELINE = "Pipeline error. See details below."
 ERROR_OUTPUT_MISSING = "Backend completed, but no new Excel output was found."
+
+
+def safety_stop_guidance(
+    error_code: str | None,
+    selected_income_year: str | None = None,
+) -> dict[str, str] | None:
+    """Return recovery text for a fail-closed input validation result.
+
+    These messages deliberately distinguish a protected source-data problem
+    from an application crash.  They never suggest changing a source amount in
+    the generated workpaper: the correction must be made, evidenced and
+    re-uploaded at source.
+    """
+    messages = {
+        "CELL-001": {
+            "title": "Stopped deliberately: an Excel error needs repair",
+            "reason": (
+                "A confirmed monetary cell contains an Excel error such as "
+                "#REF!, #VALUE! or #DIV/0!. The system did not convert it to "
+                "zero or guess a replacement amount."
+            ),
+            "action": (
+                "Repair the formula or reference in the source workbook, or "
+                "replace it with an accountant-confirmed amount. Keep the "
+                "source evidence, then upload the corrected workbook and run again."
+            ),
+        },
+        "CELL-002": {
+            "title": "Stopped deliberately: a monetary cell is not a valid number",
+            "reason": (
+                "A confirmed amount column contains text that cannot safely be "
+                "read as money (for example, $12O0). The system did not guess "
+                "which number was intended or change the source value."
+            ),
+            "action": (
+                "Correct the source cell to a valid numeric amount, retain the "
+                "supporting evidence, then upload the corrected workbook and run again."
+            ),
+        },
+        "STRUCT-003": {
+            "title": "Stopped deliberately: incompatible report tables were detected",
+            "reason": (
+                "The upload appears to contain a tax-disclosure table and a "
+                "client trial-balance table that cannot be paired safely. The "
+                "system did not choose one or combine their amounts."
+            ),
+            "action": (
+                "Upload the source Profit and Loss and Balance Sheet reports "
+                "separately, or provide a clearly scoped workbook with one report "
+                "table per sheet. Then run again."
+            ),
+        },
+    }
+    if error_code == "PERIOD-001":
+        year = selected_income_year or "the selected income year"
+        return {
+            "title": "Stopped deliberately: the source-period column is not unique",
+            "reason": (
+                f"The source report does not have exactly one clear amount column for {year}. "
+                "The system did not select a duplicate, neighbouring or similarly named period."
+            ),
+            "action": (
+                "Check the uploaded Profit and Loss report: it needs one **Account** or "
+                "**Description** header row and exactly one column headed with the selected "
+                "income year (for example `2025` or `30 June 2025`). Remove duplicate "
+                "period columns or select the matching Income year, then run again."
+            ),
+        }
+    return messages.get(error_code)
+
+
+SAFETY_STOP_NO_CHANGE = (
+    "This is a deliberate safety stop, not a tax conclusion or a software crash. "
+    "No workbook was created and no source amount was changed."
+)
 
 # ── Debug labels ──────────────────────────────────────────────────────────────
 DEBUG_FRONTEND_UPLOAD_DIR = "Frontend upload folder"

@@ -73,7 +73,8 @@ The tool generates a formatted Excel workbook containing:
 - Temporary job inputs, configuration, outputs and logs are deleted after the final workbook is copied.
 - Previous workpapers are scoped to the current Streamlit session rather than globally listed.
 - Uploaded workbooks, generated workpapers, logs and job directories are ignored by Git.
-- AI review is optional and does not determine tax treatment.
+- AI review is optional, does not determine tax treatment, and is retained in
+  a separate review-audit sidecar rather than the workbook calculation.
 
 - 每次生成任务均使用独立 UUID 目录。
 - 最终工作簿复制完成后，临时输入、配置、输出和日志会被删除。
@@ -117,9 +118,16 @@ The suite covers year routing, calculator source validation, reconciliation appr
 
 ## AI API
 
-AI is disabled by default. The current optional face-check supports Gemini and requires a separate provider API key. ChatGPT Business access is not used as an application API credential. Never commit API keys or place them in workbook metadata.
+AI is disabled by default. The optional display-only review supports Gemini and
+Grok and requires a separate provider API key. It receives minimised decision
+evidence, not the workbook or backend logs; it cannot change tax outcomes.
+Every run writes a local `*.ai_review_audit.json` sidecar with the provider,
+model, input hash, response status, findings and accountant disposition. Read
+[AI review data handling](docs/ai_review_data_handling.md) before enabling this
+feature for client work. ChatGPT Business access is not used as an application
+API credential. Never commit API keys or place them in workbook metadata.
 
-AI 默认关闭。当前可选 face-check 支持 Gemini，并需要单独的服务商 API key。ChatGPT Business 登录不能直接作为应用 API 凭证。切勿把 API key 提交到 Git 或写入工作簿元数据。
+AI 默认关闭。当前可选 face-check 支持 Gemini 和 Grok，并需要单独的服务商 API key。ChatGPT Business 登录不能直接作为应用 API 凭证。切勿把 API key 提交到 Git 或写入工作簿元数据。
 
 ## Official references
 

@@ -1332,11 +1332,8 @@ with left:
         st.markdown(f'<div class="section-header">{T.SECTION_FILES}</div>', unsafe_allow_html=True)
 
         with st.container(border=True):
-            st.markdown("**Start with the source files**")
-            st.caption(
-                "Add one combined workbook, or individual source workbooks. Include supporting "
-                "schedules when they are relevant to the review."
-            )
+            st.markdown("**Support multiple files. " \
+            "The system detects the relevant sheets and ignores unrelated files.**")
             uploaded_files = st.file_uploader(
                 T.UPLOAD_FILES_LABEL,
                 type=T.UPLOAD_FILE_TYPES,
@@ -1352,9 +1349,8 @@ with left:
 
         # ── Engagement context ───────────────────────────────────────────────
         st.markdown(f'<div class="section-header">{T.SECTION_PROFILE}</div>', unsafe_allow_html=True)
-        st.caption("Keep this brief. It is saved with the generated workpaper for later review.")
 
-        context_col_1, context_col_2, context_col_3 = st.columns([1.25, 1, 0.75])
+        context_col_1, context_col_2, context_col_3 = st.columns([1.15, 2.85, 0.8])
         with context_col_1:
             client_name = st.text_input(
                 T.CLIENT_NAME_LABEL,
@@ -1362,9 +1358,11 @@ with left:
                 help=T.CLIENT_NAME_HELP,
             )
         with context_col_2:
-            company_type = st.selectbox(
+            company_type = st.radio(
                 T.COMPANY_TYPE_LABEL,
                 options=T.COMPANY_TYPES,
+                index=0,
+                horizontal=True,
             )
         with context_col_3:
             ato_policy_year = st.selectbox(
@@ -1393,13 +1391,17 @@ with left:
             "Select the schedules that are relevant to this file. The goal is a focused review, "
             "not a generic checklist."
         )
-        selected_table_keys = st.multiselect(
-            "Add relevant review schedules",
-            options=list(OPTIONAL_TABLES),
-            format_func=lambda key: OPTIONAL_TABLES[key],
-            help="Only the schedules selected here are added to the workbook.",
-        )
-        requested_tables = {key: key in selected_table_keys for key in OPTIONAL_TABLES}
+        st.markdown("**Add relevant review schedules**")
+        st.caption("Tick only the review schedules that should appear in this workbook.")
+        requested_tables = {
+            key: st.checkbox(
+                OPTIONAL_TABLES[key],
+                value=False,
+                key=f"requested_table_{key}",
+                help="Selected schedules are added to the workbook." if key == "carry_forward_losses" else None,
+            )
+            for key in OPTIONAL_TABLES
+        }
 
         reviewed_tax_depreciation = ""
         tax_depreciation_approved_for_posting = False

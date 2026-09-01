@@ -15,7 +15,6 @@ This avoids calling backend internals directly and avoids tuple/reports mismatch
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import shutil
@@ -28,8 +27,6 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from ai_review import (
-    GeminiShadowReviewProvider,
-    GrokShadowReviewProvider,
     WorkpaperRequest,
     WorkpaperStatus,
     audit_path_for_workpaper,
@@ -38,16 +35,31 @@ from ai_review import (
     write_ai_review_audit,
     write_workpaper_request,
 )
-from ai_review.http_transport import UrllibJsonTransport
-from tax_calculators.company_tax import assess_base_rate_entity
-from tax_calculators.registry import SUPPORTED_YEARS, normalise_income_year
-from tax_calculators.validation import CalculatorError, to_decimal
-
+from tax_calculators.registry import SUPPORTED_YEARS
+from tax_calculators.validation import CalculatorError
 
 try:
-    from openpyxl import load_workbook
-except Exception:
-    load_workbook = None
+    from .ai_shadow_review import run_ai_shadow_review as _run_ai_shadow_review
+    from .job_options import (
+        DEFAULT_REQUESTED_TABLES,
+        base_rate_assessment_is_confirmed as _base_rate_assessment_is_confirmed,
+        build_base_rate_entity_assessment,
+        build_job_options as _build_job_options,
+        normalise_policy_year as _normalise_policy_year,
+        normalise_requested_tables as _normalise_requested_tables,
+        normalise_reviewed_tax_depreciation as _normalise_reviewed_tax_depreciation,
+    )
+except ImportError:  # Streamlit imports this module from frontend/ directly.
+    from ai_shadow_review import run_ai_shadow_review as _run_ai_shadow_review
+    from job_options import (
+        DEFAULT_REQUESTED_TABLES,
+        base_rate_assessment_is_confirmed as _base_rate_assessment_is_confirmed,
+        build_base_rate_entity_assessment,
+        build_job_options as _build_job_options,
+        normalise_policy_year as _normalise_policy_year,
+        normalise_requested_tables as _normalise_requested_tables,
+        normalise_reviewed_tax_depreciation as _normalise_reviewed_tax_depreciation,
+    )
 
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -70,18 +82,6 @@ logger = logging.getLogger(__name__)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-
-DEFAULT_REQUESTED_TABLES: dict[str, bool] = {
-    "carry_forward_losses": False,
-    "rd_tax_incentive": False,
-    "div7a": False,
-    "fbt_entertainment": False,
-    "depreciation": False,
-    "superannuation": False,
-    "gst_reconciliation": False,
-    "related_party_loans": False,
-    "psi": False,
-}
 
 DEFAULT_BACKEND_TIMEOUT_SECONDS = 180
 MIN_BACKEND_TIMEOUT_SECONDS = 30
@@ -217,177 +217,6 @@ def _detect_reports_from_log(stdout: str, stderr: str) -> dict[str, bool]:
     }
 
 
-# ── Job option helpers ────────────────────────────────────────────────────────
-
-def _normalise_requested_tables(
-    requested_tables: dict[str, bool] | None,
-) -> dict[str, bool]:
-    tables = DEFAULT_REQUESTED_TABLES.copy()
-
-    if not requested_tables:
-        return tables
-
-    for key, value in requested_tables.items():
-        if key in tables:
-            tables[key] = bool(value)
-
-    return tables
-
-
-def _normalise_policy_year(ato_policy_year: str | None = None) -> str:
-    """Validate an explicitly selected policy year; never substitute another."""
-
-    if ato_policy_year is None:
-        return "2026"
-    return normalise_income_year(ato_policy_year)
-
-
-def build_base_rate_entity_assessment(
-    income_year: str,
-    *,
-    aggregated_turnover: float | int | str,
-    total_assessable_income: float | int | str,
-    base_rate_entity_passive_income: float | int | str,
-    reviewer_confirmed: bool = False,
-) -> dict[str, Any]:
-    """Return a JSON-safe assessment for the frontend and job audit record."""
-
-    assessment = assess_base_rate_entity(
-        _normalise_policy_year(income_year),
-        aggregated_turnover=aggregated_turnover,
-        total_assessable_income=total_assessable_income,
-        base_rate_entity_passive_income=base_rate_entity_passive_income,
-    )
-    return {
-        "income_year": assessment.income_year,
-        "aggregated_turnover": str(aggregated_turnover),
-        "total_assessable_income": str(total_assessable_income),
-        "base_rate_entity_passive_income": str(base_rate_entity_passive_income),
-        "passive_income_ratio": str(assessment.passive_income_ratio),
-        "turnover_threshold": str(assessment.turnover_threshold),
-        "passive_income_ratio_limit": str(assessment.passive_income_ratio_limit),
-        "turnover_below_threshold": assessment.turnover_below_threshold,
-        "passive_income_ratio_within_limit": (
-            assessment.passive_income_ratio_within_limit
-        ),
-        "eligible_on_supplied_figures": assessment.eligible_on_supplied_figures,
-        "reviewer_confirmed": reviewer_confirmed is True,
-    }
-
-
-def _base_rate_assessment_is_confirmed(
-    assessment: dict[str, Any] | None,
-    income_year: str,
-) -> bool:
-    if not assessment or assessment.get("reviewer_confirmed") is not True:
-        return False
-    try:
-        if to_decimal(
-            assessment.get("total_assessable_income"),
-            "total_assessable_income",
-        ) <= 0:
-            return False
-        verified = build_base_rate_entity_assessment(
-            income_year,
-            aggregated_turnover=assessment.get("aggregated_turnover"),
-            total_assessable_income=assessment.get("total_assessable_income"),
-            base_rate_entity_passive_income=assessment.get(
-                "base_rate_entity_passive_income"
-            ),
-            reviewer_confirmed=True,
-        )
-    except (CalculatorError, TypeError, ValueError):
-        return False
-    return verified["eligible_on_supplied_figures"] is True
-
-
-def _normalise_reviewed_tax_depreciation(
-    amount: float | int | str | None,
-    approved_for_posting: bool = False,
-) -> dict[str, Any]:
-    """Keep a supplied 7F amount explicit and separate from posting approval."""
-
-    if amount is None or not str(amount).strip():
-        return {"amount": None, "approved_for_posting": False}
-
-    text = str(amount).strip().replace("$", "").replace(",", "")
-    decimal_amount = to_decimal(text, "reviewed_tax_depreciation")
-    if decimal_amount < 0:
-        raise CalculatorError("reviewed_tax_depreciation must not be negative")
-
-    return {
-        "amount": str(decimal_amount),
-        "approved_for_posting": approved_for_posting is True,
-    }
-
-
-def _build_job_options(
-    ato_policy_year: str = "2026",
-    requested_tables: dict[str, bool] | None = None,
-    reviewer_notes: str = "",
-    company_profile: str = "",
-    document_description: str = "",
-    client_name: str = "",
-    company_tax_rate_category: str = "review_required",
-    base_rate_entity_assessment: dict[str, Any] | None = None,
-    reviewed_tax_depreciation: float | int | str | None = None,
-    tax_depreciation_approved_for_posting: bool = False,
-    retain_job_files: bool = False,
-) -> dict[str, Any]:
-    year = _normalise_policy_year(ato_policy_year)
-    rate_category = company_tax_rate_category
-    if rate_category == "base_rate_entity" and not _base_rate_assessment_is_confirmed(
-        base_rate_entity_assessment,
-        year,
-    ):
-        rate_category = "review_required"
-
-    return {
-        "ato_policy_year": year,
-        "itr_policy_year": year,
-        "requested_tables": _normalise_requested_tables(requested_tables),
-        "reviewer_notes": reviewer_notes or "",
-        "company_profile": company_profile or "",
-        "document_description": document_description or "",
-        "client_name": client_name or "",
-        "company_tax_rate_category": (
-            rate_category
-            if rate_category in {"base_rate_entity", "general"}
-            else "review_required"
-        ),
-        "base_rate_entity_assessment": base_rate_entity_assessment or {},
-        "reviewed_tax_depreciation": _normalise_reviewed_tax_depreciation(
-            reviewed_tax_depreciation,
-            tax_depreciation_approved_for_posting,
-        ),
-        "retain_job_files": bool(retain_job_files),
-        "created_at": datetime.now().isoformat(timespec="seconds"),
-        "source": "frontend/job_runner.py",
-    }
-
-
-def _write_job_config(job_options: dict[str, Any], path: Path) -> Path:
-    """
-    Writes frontend-selected settings for v1/main.py, itr_rules.py, ato_policy.py,
-    workpaper_builder.py, write_workbook.py, etc.
-
-    Backend reads the per-job config path supplied below.
-
-    Backend subprocess also receives:
-        ATO_POLICY_YEAR
-        ITR_POLICY_YEAR
-        TAX_JOB_CONFIG_PATH
-    """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(job_options, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    logger.info("Wrote backend job config: %s", path)
-    return path
-
-
 # ── Backend subprocess ────────────────────────────────────────────────────────
 
 def _run_v1_main(
@@ -412,228 +241,6 @@ def _run_v1_main(
         env=env,
         timeout=_backend_timeout_seconds(),
     )
-
-
-# ── Gemini face-check helpers ─────────────────────────────────────────────────
-
-def _summarise_workbook_for_ai(path: Path, max_rows_per_sheet: int = 40) -> str:
-    """
-    Creates a compact text summary of the generated workbook.
-
-    This intentionally does not send the whole workbook file to Gemini.
-    It sends:
-    - workbook name
-    - sheet names
-    - dimensions
-    - first non-empty rows per sheet
-    """
-    if load_workbook is None:
-        return "Workbook summary unavailable because openpyxl could not be imported."
-
-    if not path.exists():
-        return f"Workbook summary unavailable because file does not exist: {path}"
-
-    try:
-        wb = load_workbook(path, data_only=True, read_only=True)
-    except Exception as exc:
-        return f"Workbook summary unavailable because openpyxl failed to read it: {exc}"
-
-    parts: list[str] = []
-
-    parts.append(f"Workbook: {path.name}")
-    parts.append(f"Sheets: {', '.join(wb.sheetnames)}")
-
-    for ws in wb.worksheets:
-        parts.append("")
-        parts.append(f"=== Sheet: {ws.title} ===")
-        parts.append(f"Max rows: {ws.max_row}, max columns: {ws.max_column}")
-
-        rows_added = 0
-
-        for row in ws.iter_rows(
-            min_row=1,
-            max_row=min(ws.max_row, max_rows_per_sheet),
-            values_only=True,
-        ):
-            values = ["" if cell is None else str(cell) for cell in row]
-            joined = " | ".join(values).strip()
-
-            if joined:
-                parts.append(joined[:1200])
-                rows_added += 1
-
-            if rows_added >= max_rows_per_sheet:
-                break
-
-    try:
-        wb.close()
-    except Exception:
-        pass
-
-    return "\n".join(parts)[:60000]
-
-
-def _run_gemini_face_check(
-    job_options: dict[str, Any],
-    backend_output: Path,
-    stdout: str = "",
-    stderr: str = "",
-    api_key: str = "",
-    model: str = "gemini-2.5-flash",
-) -> dict[str, str]:
-    """
-    Optional AI review pass.
-
-    Requires:
-        pip install -U google-genai
-
-    The API key and model are supplied explicitly by the current request.
-
-    This is a face-check only. It should not replace accountant review.
-    """
-    api_key = str(api_key or "").strip()
-    if not api_key:
-        return {
-            "status": "skipped",
-            "summary": (
-                "Gemini face-check skipped because no API key was supplied for "
-                "this request."
-            ),
-        }
-
-    try:
-        from google import genai
-    except Exception as exc:
-        return {
-            "status": "skipped",
-            "summary": (
-                "Gemini face-check skipped because google-genai is not installed. "
-                "Install with: pip install -U google-genai\n\n"
-                f"Import error: {exc}"
-            ),
-        }
-
-    workbook_summary = _summarise_workbook_for_ai(backend_output)
-
-    prompt = f"""
-You are reviewing an Australian company tax workpaper generated from Xero reports.
-
-Scope:
-- This is an accountant-review face-check only.
-- Do not provide final tax advice.
-- Do not invent missing facts.
-- Only flag issues visible from the user inputs, backend logs, and workbook summary.
-
-Your job:
-- Identify obvious issues on the face of the workpaper.
-- Check whether selected optional schedules appear relevant.
-- Check whether income and expense labels look unusual.
-- Check whether these matters need review:
-  - R&D tax incentive
-  - carry-forward losses
-  - Division 7A / shareholder loans
-  - superannuation timing
-  - depreciation / capital allowances
-  - GST / BAS reconciliation
-  - PSI
-  - related-party loans
-  - FBT / entertainment
-
-User-selected job options:
-{json.dumps(job_options, indent=2, ensure_ascii=False)}
-
-Backend stdout tail:
-{stdout[-8000:]}
-
-Backend stderr tail:
-{stderr[-8000:]}
-
-Generated workbook summary:
-{workbook_summary}
-
-Return format:
-1. Overall face-check result
-2. Possible issues
-3. Missing information / schedules to request
-4. High-priority review points
-5. Low-priority observations
-"""
-
-    try:
-        client = genai.Client(api_key=api_key)
-
-        response = client.models.generate_content(
-            model=model or "gemini-2.5-flash",
-            contents=prompt,
-        )
-
-        return {
-            "status": "success",
-            "summary": response.text or "Gemini returned an empty response.",
-        }
-
-    except Exception as exc:
-        logger.exception("Gemini face-check failed")
-        return {
-            "status": "error",
-            "summary": f"Gemini face-check failed: {type(exc).__name__}: {exc}",
-        }
-
-
-def _run_ai_shadow_review(
-    *,
-    workpaper_result,
-    ai_provider: str,
-    api_key: str,
-    model: str,
-) -> dict[str, Any]:
-    """Run schema-constrained review evidence through the selected AI adapter."""
-
-    provider_kwargs = {
-        "api_key": api_key,
-        "model": model,
-        "transport": UrllibJsonTransport(),
-    }
-    if ai_provider == "Gemini":
-        provider = GeminiShadowReviewProvider(**provider_kwargs)
-    elif ai_provider == "Grok":
-        provider = GrokShadowReviewProvider(**provider_kwargs)
-    else:
-        return {
-            "status": "skipped",
-            "summary": f"Unsupported AI review provider: {ai_provider}.",
-            "findings": [],
-        }
-
-    try:
-        review = provider.review(workpaper_result, workpaper_result.decision_traces)
-    except Exception as exc:
-        logger.exception("AI shadow review failed for provider=%s", ai_provider)
-        return {
-            "status": "error",
-            "summary": f"{ai_provider} shadow review failed: {type(exc).__name__}: {exc}",
-            "findings": [],
-        }
-
-    findings = [
-        {
-            "severity": finding.severity.value,
-            "decision_id": finding.decision_id,
-            "evidence": list(finding.evidence),
-            "missing_facts": list(finding.missing_facts),
-            "recommended_review_action": finding.recommended_review_action,
-        }
-        for finding in review.findings
-    ]
-    return {
-        "status": "success",
-        "summary": (
-            f"{ai_provider} returned {len(findings)} display-only, schema-validated "
-            "review finding(s)."
-        ),
-        "findings": findings,
-        "limitations": list(review.limitations),
-    }
 
 
 # ── Error helper ──────────────────────────────────────────────────────────────

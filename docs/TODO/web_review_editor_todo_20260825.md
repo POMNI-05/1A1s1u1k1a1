@@ -79,3 +79,17 @@ unchanged.
   spreadsheet surface and download a separate revised Excel file.
 - **Validation:** full test suite passed (107 tests), including a regression
   test for the inline JavaScript clipboard parser.
+
+## Stage 19 — Repository structure triage and focused cleanup
+
+- [ ] Map the current frontend/backend/workpaper modules and identify files
+  whose size or mixed responsibilities now make maintenance risky.
+- [ ] Use existing sample data, retained job artifacts or real project scripts
+  to reproduce concrete issues; do not add broad new test scaffolding.
+- [ ] Apply only focused fixes or reorganisation that preserve deterministic
+  tax outcomes and the original-workbook immutability boundary.
+- [ ] Update the owning workflow/debugging log and validate with existing
+  workflows.
+- **Exit criterion:** remaining issues are either fixed or explicitly
+  documented with evidence, and any cleanup reduces coupling without changing
+  tax treatment.

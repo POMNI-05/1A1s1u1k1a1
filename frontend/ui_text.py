@@ -9,8 +9,8 @@ APP_TITLE = "Tax Workpaper Generator"
 APP_SUBTITLE = "ICGTAX Partners · Automated Tax Reconciliation"
 
 # ── Section headers ───────────────────────────────────────────────────────────
-SECTION_FILES = "1  Upload files"
-SECTION_PROFILE = "Engagement context"
+SECTION_FILES = "Upload Balance Sheet and Profit & Loss sheets"
+SECTION_PROFILE = "Notes for workpaper"
 SECTION_DESCRIBE = "Workpaper context"
 SECTION_RESULT = "Result"
 SECTION_REVISE = "Questions & revision requests"
@@ -37,11 +37,19 @@ CLIENT_NAME_HELP = "Used in the output filename. Optional."
 # ── Company profile prompt ────────────────────────────────────────────────────
 COMPANY_TYPE_LABEL = "Company type"
 COMPANY_TYPES = [
-    "Service company",
+    "Service / consulting company",
+    "Professional practice",
     "Product / trading company",
-    "Tech / software company (possible R&D)",
+    "Retail / hospitality business",
+    "Wholesale / distribution business",
+    "Construction / contracting business",
+    "Manufacturing business",
+    "Software / SaaS company",
+    "Technology company (possible R&D)",
     "Investment / holding company",
-    "Property company",
+    "Property investment company",
+    "Property development company",
+    "Mixed operating group",
     "Other",
 ]
 

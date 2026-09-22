@@ -147,6 +147,61 @@ class JobRunnerTests(unittest.TestCase):
             {"amount": None, "approved_for_posting": False},
         )
 
+    def test_reviewed_tax_losses_separate_eligibility_from_posting_approval(self):
+        options = job_runner._build_job_options(
+            reviewed_tax_losses={
+                "opening_losses": "$100,000",
+                "requested_utilisation": "60,000",
+                "eligibility_confirmed": True,
+                "eligibility_basis": "Continuity of ownership reviewed",
+                "review_note": "Agrees to loss schedule",
+                "approved_for_posting": False,
+            },
+        )
+        self.assertEqual(
+            options["reviewed_tax_losses"],
+            {
+                "opening_losses": "100000",
+                "requested_utilisation": "60000",
+                "eligibility_confirmed": True,
+                "eligibility_basis": "Continuity of ownership reviewed",
+                "review_note": "Agrees to loss schedule",
+                "approved_for_posting": False,
+            },
+        )
+
+        unconfirmed = job_runner._build_job_options(
+            reviewed_tax_losses={
+                "opening_losses": "100000",
+                "requested_utilisation": "60000",
+                "eligibility_confirmed": False,
+                "approved_for_posting": True,
+            },
+        )
+        self.assertFalse(unconfirmed["reviewed_tax_losses"]["approved_for_posting"])
+
+    def test_reviewed_div7a_normalises_reviewed_inputs(self):
+        options = job_runner._build_job_options(
+            reviewed_div7a={
+                "private_company_status": "confirmed_private",
+                "transaction_exists": "yes",
+                "transaction_type": "loan",
+                "source_balance": "$85,000",
+                "balance_direction": "shareholder_director_owes_company",
+                "shareholder_or_associate_status": "confirmed",
+                "opening_balance": "100,000",
+                "remaining_term_years": "5",
+                "eligible_repayments": "12,000",
+            },
+        )
+
+        div7a = options["reviewed_div7a"]
+        self.assertEqual(div7a["private_company_status"], "confirmed_private")
+        self.assertEqual(div7a["source_balance"], "85000")
+        self.assertEqual(div7a["opening_balance"], "100000")
+        self.assertEqual(div7a["remaining_term_years"], 5)
+        self.assertEqual(div7a["eligible_repayments"], "12000")
+
     def test_base_rate_option_requires_passing_confirmed_assessment(self):
         unconfirmed = job_runner.build_base_rate_entity_assessment(
             "2026",

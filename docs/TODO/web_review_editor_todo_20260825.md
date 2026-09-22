@@ -93,3 +93,79 @@ unchanged.
 - **Exit criterion:** remaining issues are either fixed or explicitly
   documented with evidence, and any cleanup reduces coupling without changing
   tax treatment.
+
+## Stage 20 — Generator information architecture and ATO status capture
+
+- [x] Rename the current industry-style company type prompt to business profile
+  / industry so it is not confused with ATO company-return status.
+- [x] Add a separate ATO company status capture area for residency, entity
+  type, activity indicator, business indicators, SGE/CBC and consolidation
+  status.
+- [x] Keep company tax-rate determination separate and deterministic; special
+  company status or rate categories such as non-profit, trustee capacity, life
+  insurance and credit union must force review rather than defaulting to 30%.
+- [x] Compact the ATO status UI so standard companies can use a short preset
+  and detailed return-status fields appear only when needed.
+- [x] Make the business profile and ATO status controls visually distinct,
+  always visible, and explicit about whether each field affects review scope,
+  tax-rate gating, or calculation output.
+- [x] Add a typed frontend-to-backend review-schedule handshake for
+  carry-forward losses, R&D and Division 7A: frontend selection activates
+  backend review schedules, but no deduction, offset, deemed dividend or
+  adjustment posts without reviewed facts.
+- [x] Move ATO return status and company tax-rate determination immediately
+  after upload, then group engagement profile and reconciliation-scope planning
+  together with highlighted schedule suggestions and plain-language reasons.
+- [x] Add reviewed carry-forward tax loss workflow as a question-driven,
+  reviewer/manual-first flow. MVP asks every return whether prior-year tax
+  losses exist and captures reviewed available losses, proposed utilisation and
+  eligibility review status in a table; backend calculation/posting to Item 7R
+  remains deferred until the reviewer-approved posting model is implemented.
+- [x] Add reviewed Division 7A workflow as a dynamic review flow. MVP captures
+  private-company status, transaction type and reviewer-controlled legal gates;
+  only confirmed complying-loan branches run the deterministic MYR calculator,
+  and all deemed-dividend/legal conclusions remain review-required.
+- [ ] Design the next staged web flow with separate information, generation and
+  review/edit surfaces before moving the result/review UI.
+- **Exit criterion:** engagement profile, ATO return status and tax-rate
+  determination are visibly separate, and no captured status field changes tax
+  treatment without explicit reviewed rate evidence.
+- **Latest validation:** frontend compile check and focused UI/job-runner
+  regressions passed (14 tests, 7 subtests).
+- **Schedule-handshake validation:** frontend/backend compile check and focused
+  output/job/UI/Division 7A/loss tests passed (25 tests, 10 subtests).
+- **Layout/suggestion validation:** frontend compile check and focused
+  UI/job-runner/output regressions passed (21 tests, 10 subtests).
+- **Tax-loss workflow validation:** frontend/backend compile check and focused
+  job/output/reconciliation/UI regressions passed (35 tests, 10 subtests).
+- **Division 7A workflow validation:** frontend/backend compile check and
+  focused job/output/Div 7A calculator tests passed (27 tests, 6 subtests).
+
+## Stage 21 — Two-stage scan, confirm and generate workflow
+
+- [x] Add a scan-only contract that reuses the existing cleaner/discovery path
+  and records source-file hashes without labelling, calculating tax or writing a
+  workbook.
+- [x] Replace the first generator screen with minimal upload/profile fields and
+  a Scan files action.
+- [x] Add a two-column Scan & confirm screen where the left side is immutable
+  machine-observed evidence and the right side stores reviewer-confirmed facts.
+- [x] Compile `requested_tables` from scan suggestions plus reviewer
+  confirmations, while keeping a manual Add another review area control.
+- [x] Verify source hashes before Stage 2 generation and then call the existing
+  deterministic job runner unchanged for labelling, calculation and workbook
+  writing.
+- [x] Preserve the one-step generation path internally until the staged workflow
+  is stable.
+- **Exit criterion:** users upload minimal facts, scan evidence, confirm review
+  areas/questions, and only then generate a workpaper from the existing backend.
+- **Initial validation:** frontend/scan/backend syntax compile passed with
+  bytecode cache redirected to `/tmp`. The system Python 3.9 environment could
+  not run the dependency-backed suite, so validation was repeated with the
+  available Miniconda Python 3.13 environment.
+- **Layout refinement:** removed the obsolete generator right-side placeholder
+  panel, made Generate workpaper a full-width staged workflow, moved the final
+  generate action below the internal scan/confirm columns, and compacted
+  tax-rate review warnings into status cards.
+- **Release validation:** `git diff --check` passed and the complete unittest
+  suite passed under Python 3.13 with all 114 tests successful.

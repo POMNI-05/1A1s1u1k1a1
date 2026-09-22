@@ -14,7 +14,6 @@ try:
     from .cleaner import CleanedReports, load_clean_report_bundle, clean_amount
     from .config import (
         COMPANY_TAX_RATE_CATEGORY,
-        RD_BREAKDOWN_TEMPLATE,
         SELECTED_ATO_POLICY,
         SELECTED_INCOME_YEAR,
         TAX_ADJUSTMENTS,
@@ -28,7 +27,6 @@ except ImportError:  # Direct-script compatibility.
     from cleaner import CleanedReports, load_clean_report_bundle, clean_amount
     from config import (
         COMPANY_TAX_RATE_CATEGORY,
-        RD_BREAKDOWN_TEMPLATE,
         SELECTED_ATO_POLICY,
         SELECTED_INCOME_YEAR,
         TAX_ADJUSTMENTS,
@@ -41,6 +39,8 @@ except ImportError:  # Direct-script compatibility.
 
 from ai_review import DecisionTrace, ReviewItem
 from tax_calculators.company_tax import calculate_company_tax
+from tax_calculators.division7a import calculate_minimum_yearly_repayment
+from tax_calculators.validation import CalculatorError
 
 logger = logging.getLogger(__name__)
 
@@ -66,10 +66,6 @@ class Workpaper:
 
 
 SUPPORT_TABLE_TEMPLATES: dict[str, tuple[str, list[dict[str, Any]]]] = {
-    "div7a": (
-        "Division 7A / Shareholder Loans",
-        [{"Description": "Closing shareholder/director loan balance", "Amount": None, "Review note": "Confirm debit/credit balance and Division 7A treatment."}],
-    ),
     "fbt_entertainment": (
         "FBT / Entertainment Review",
         [{"Description": "Entertainment and meal expenses", "Amount": None, "Review note": "Confirm deductibility, GST and FBT treatment."}],
@@ -93,6 +89,24 @@ SUPPORT_TABLE_TEMPLATES: dict[str, tuple[str, list[dict[str, Any]]]] = {
     "psi": (
         "Personal Services Income Review",
         [{"Description": "PSI/PSE review", "Amount": None, "Review note": "Complete PSI tests and attribution review where applicable."}],
+    ),
+}
+
+REVIEW_SCHEDULE_HANDSHAKES: dict[str, str] = {
+    "carry_forward_losses": (
+        "Frontend selection activates a backend loss-review schedule only. "
+        "Loss utilisation remains blocked until eligibility, available losses "
+        "and the amount to deduct are reviewed."
+    ),
+    "rd_tax_incentive": (
+        "Frontend selection activates a backend R&D review schedule only. "
+        "No Item 7D add-back, Item 21 offset or R&D amount is posted from this "
+        "selection alone."
+    ),
+    "div7a": (
+        "Frontend selection activates a backend Division 7A review schedule only. "
+        "No deemed dividend, interest, repayment shortfall or distributable "
+        "surplus outcome is calculated from this selection alone."
     ),
 }
 
@@ -1112,21 +1126,362 @@ def _build_tax_reconciliation_review_checks(
     ])
 
 
-def _build_carry_forward_losses_input(periods: list[str]) -> pd.DataFrame:
-    """Create blank reviewer inputs only for periods validated from the source report."""
+def _build_carry_forward_losses_input(
+    periods: list[str],
+    reviewed_tax_losses: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Create a review-gated loss schedule for source-validated periods."""
+
+    reviewed = reviewed_tax_losses or {}
+    rows: list[dict[str, Any]] = [
+        {
+            "Period": "All selected periods",
+            "Review area": "Schedule required trigger",
+            "Required evidence": (
+                "Reviewer confirmed prior-year tax losses exist. If No or Not sure "
+                "was selected in the UI, this schedule should not be used to post Item 7R."
+            ),
+            "Input amount": None,
+            "ITR connection": "Item 7R / Losses schedule",
+            "Status": "REVIEW REQUIRED - no loss deduction posted",
+            "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["carry_forward_losses"],
+        },
+        {
+            "Period": "All selected periods",
+            "Review area": "Eligibility gate",
+            "Required evidence": (
+                "Continuity of ownership/control or same/similar business analysis, "
+                "available fraction where applicable, and loss-year ordering."
+            ),
+            "Input amount": None,
+            "ITR connection": "Item 7R",
+            "Status": (
+                "ELIGIBILITY CONFIRMED - calculation still not posted"
+                if reviewed.get("eligibility_confirmed") is True
+                else "BLOCKED UNTIL ACCOUNTANT REVIEW"
+            ),
+            "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["carry_forward_losses"],
+        },
+    ]
+
+    rows.extend(
+        {
+            "Period": period,
+            "Review area": "Reviewed loss movement",
+            "Required evidence": (
+                "MVP is reviewer/manual first. Reviewed available losses and "
+                "proposed utilisation are captured for accountant review only."
+            ),
+            "Reviewed available prior-year losses": reviewed.get("opening_losses"),
+            "Requested utilisation": reviewed.get("requested_utilisation"),
+            "Calculated losses utilised": None,
+            "New losses incurred": None,
+            "Closing losses": None,
+            "ITR connection": "Item 7R",
+            "Status": (
+                "READY FOR FUTURE CALCULATION - not posted"
+                if reviewed.get("eligibility_confirmed") is True
+                and reviewed.get("opening_losses") is not None
+                else "REVIEW INPUT REQUIRED - not posted"
+            ),
+            "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["carry_forward_losses"],
+        }
+        for period in periods
+    )
+    return pd.DataFrame(rows)
+
+
+def _build_rd_tax_incentive_review_schedule(income_year: str) -> pd.DataFrame:
+    """Create the backend R&D review schedule activated by frontend selection."""
+
     return pd.DataFrame(
         [
             {
-                "Period": period,
-                "Opening losses": None,
-                "Losses utilised": None,
-                "New losses incurred": None,
-                "Closing losses": None,
-                "Status": "REVIEW INPUT REQUIRED",
-            }
-            for period in periods
+                "Review area": "Registration gate",
+                "Required evidence": (
+                    "DISR/IISA registration number, registered activities and "
+                    f"registration period covering FY{income_year}."
+                ),
+                "Reviewed amount": None,
+                "ITR connection": "R&D schedule / Item 21",
+                "Status": "REVIEW REQUIRED - no R&D claim posted",
+                "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["rd_tax_incentive"],
+            },
+            {
+                "Review area": "Schedule tie-out",
+                "Required evidence": (
+                    "R&D schedule expenditure agrees to ledger detail, tax "
+                    "workpapers and excluded/non-eligible amounts."
+                ),
+                "Reviewed amount": None,
+                "ITR connection": "R&D schedule",
+                "Status": "REVIEW REQUIRED - no offset calculated",
+                "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["rd_tax_incentive"],
+            },
+            {
+                "Review area": "Associate-payment check",
+                "Required evidence": (
+                    "Amounts incurred to associates are identified and payment "
+                    "timing is reviewed before any notional deduction is claimed."
+                ),
+                "Reviewed amount": None,
+                "ITR connection": "R&D schedule",
+                "Status": "REVIEW REQUIRED",
+                "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["rd_tax_incentive"],
+            },
+            {
+                "Review area": "Accounting add-back agreement",
+                "Required evidence": (
+                    "Label 7D add-back agrees to R&D expenditure already deducted "
+                    "in the accounts and does not double-count capitalised amounts."
+                ),
+                "Reviewed amount": None,
+                "ITR connection": "Item 7D",
+                "Status": "REVIEW REQUIRED - no Item 7D posting from selection alone",
+                "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["rd_tax_incentive"],
+            },
+            {
+                "Review area": "Company-return agreement",
+                "Required evidence": (
+                    "Item 21 refundable/non-refundable offset treatment, intensity "
+                    "category and any clawback/feedstock/balancing adjustment are agreed."
+                ),
+                "Reviewed amount": None,
+                "ITR connection": "Item 21 / Item 7",
+                "Status": "REVIEW REQUIRED",
+                "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["rd_tax_incentive"],
+            },
         ]
     )
+
+
+def _div7a_row(area: str, fact: Any, status: str, note: str = "") -> dict[str, Any]:
+    return {
+        "Review area": area,
+        "Reviewed fact": fact,
+        "Status": status,
+        "Review note": note,
+        "Backend handshake": REVIEW_SCHEDULE_HANDSHAKES["div7a"],
+    }
+
+
+def _build_div7a_review_schedule(
+    income_year: str,
+    reviewed_div7a: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Create the backend Division 7A schedule from reviewer-controlled facts."""
+
+    data = reviewed_div7a or {}
+    rows: list[dict[str, Any]] = []
+    private_status = data.get("private_company_status", "review_required")
+    rows.append(
+        _div7a_row(
+            "Entity status",
+            private_status,
+            (
+                "CONFIRMED"
+                if private_status == "confirmed_private"
+                else "NOT APPLICABLE"
+                if private_status == "not_private"
+                else "REVIEW REQUIRED"
+            ),
+            "Private-company status is reviewer controlled; do not infer it from entity name alone.",
+        )
+    )
+
+    if private_status != "confirmed_private":
+        rows.append(
+            _div7a_row(
+                "Final status",
+                "",
+                "REVIEW REQUIRED" if private_status == "review_required" else "NOT APPLICABLE",
+                "No automatic Division 7A calculation was performed.",
+            )
+        )
+        return pd.DataFrame(rows)
+
+    transaction_exists = data.get("transaction_exists", "unsure")
+    rows.append(
+        _div7a_row(
+            "Transaction exists",
+            transaction_exists,
+            (
+                "NOT APPLICABLE"
+                if transaction_exists == "no"
+                else "POSSIBLE DIV 7A TRIGGER"
+                if transaction_exists == "yes"
+                else "REVIEW REQUIRED"
+            ),
+            "Payments, loans or debt forgiveness can exist without an obvious year-end BS balance.",
+        )
+    )
+    if transaction_exists != "yes":
+        rows.append(
+            _div7a_row(
+                "Final status",
+                "",
+                "NOT APPLICABLE" if transaction_exists == "no" else "REVIEW REQUIRED",
+                "No detailed Division 7A calculation was performed.",
+            )
+        )
+        return pd.DataFrame(rows)
+
+    transaction_type = data.get("transaction_type", "")
+    rows.extend(
+        [
+            _div7a_row("Transaction type", transaction_type, "INPUT RECORDED"),
+            _div7a_row("Trigger account", data.get("source_account", ""), "REVIEWED INPUT"),
+            _div7a_row("Trigger balance", data.get("source_balance"), "REVIEWED INPUT"),
+            _div7a_row("Direction", data.get("balance_direction", "unsure"), "REVIEWED INPUT"),
+        ]
+    )
+
+    if transaction_type != "loan":
+        status = (
+            "SPECIALIST REVIEW REQUIRED"
+            if transaction_type in {"trust_upe", "indirect_interposed"}
+            else "POTENTIAL s109C ISSUE - REVIEW REQUIRED"
+            if transaction_type == "payment_private_expense"
+            else "POTENTIAL s109F DEEMED DIVIDEND - REVIEW REQUIRED"
+            if transaction_type == "debt_forgiveness"
+            else "REVIEW REQUIRED"
+        )
+        rows.append(
+            _div7a_row(
+                "Final status",
+                data.get("reviewed_distributable_surplus"),
+                status,
+                data.get("review_note", "") or data.get("source_note", ""),
+            )
+        )
+        return pd.DataFrame(rows)
+
+    shareholder_status = data.get("shareholder_or_associate_status", "review_required")
+    rows.append(
+        _div7a_row(
+            "Shareholder / associate status",
+            shareholder_status,
+            "CONFIRMED" if shareholder_status == "confirmed" else "REVIEW REQUIRED",
+            "Associate status is a reviewer-controlled legal fact.",
+        )
+    )
+    if shareholder_status != "confirmed":
+        rows.append(
+            _div7a_row(
+                "Final status",
+                "",
+                "REVIEW REQUIRED",
+                "Loan workflow stopped because shareholder/associate status was not confirmed.",
+            )
+        )
+        return pd.DataFrame(rows)
+
+    rows.extend(
+        [
+            _div7a_row("Loan amount", data.get("loan_amount"), "REVIEWED INPUT"),
+            _div7a_row("Opening loan balance", data.get("opening_balance"), "REVIEWED INPUT"),
+            _div7a_row(
+                "Repayments before lodgment day",
+                data.get("repayments_before_lodgment"),
+                "REVIEWED INPUT",
+            ),
+            _div7a_row(
+                "Outstanding at lodgment day",
+                data.get("outstanding_at_lodgment"),
+                "REVIEWED INPUT",
+            ),
+        ]
+    )
+
+    fully_repaid = data.get("fully_repaid_before_lodgment", "review_required")
+    rows.append(_div7a_row("Fully repaid before lodgment day", fully_repaid, "REVIEWED INPUT"))
+    if fully_repaid == "yes":
+        rows.append(
+            _div7a_row(
+                "Repayment integrity review",
+                data.get("repayment_integrity_reviewed") is True,
+                "CONFIRMED" if data.get("repayment_integrity_reviewed") is True else "REVIEW REQUIRED",
+            )
+        )
+        rows.append(
+            _div7a_row(
+                "Final status",
+                "",
+                "REPAID BEFORE LODGMENT DAY",
+                "No automatic deemed-dividend calculation was performed.",
+            )
+        )
+        return pd.DataFrame(rows)
+    if fully_repaid != "no":
+        rows.append(_div7a_row("Final status", "", "REVIEW REQUIRED", "Repayment status not confirmed."))
+        return pd.DataFrame(rows)
+
+    complying_status = data.get("complying_loan_status", "review_required")
+    rows.append(_div7a_row("Complying loan agreement", complying_status, "REVIEWED INPUT"))
+    if complying_status == "no":
+        rows.extend(
+            [
+                _div7a_row(
+                    "Reviewed distributable surplus",
+                    data.get("reviewed_distributable_surplus"),
+                    "REVIEW REQUIRED",
+                ),
+                _div7a_row(
+                    "Final status",
+                    "",
+                    "POTENTIAL DEEMED DIVIDEND - REVIEW REQUIRED",
+                    "No final deemed dividend calculated in MVP.",
+                ),
+            ]
+        )
+        return pd.DataFrame(rows)
+    if complying_status != "confirmed":
+        rows.append(_div7a_row("Final status", "", "REVIEW REQUIRED", "Complying agreement not confirmed."))
+        return pd.DataFrame(rows)
+
+    rows.extend(
+        [
+            _div7a_row("Loan start year", data.get("loan_start_year"), "REVIEWED INPUT"),
+            _div7a_row("Loan term years", data.get("loan_term_years"), "REVIEWED INPUT"),
+            _div7a_row("Remaining term years", data.get("remaining_term_years"), "REVIEWED INPUT"),
+            _div7a_row("Eligible repayments", data.get("eligible_repayments"), "REVIEWED INPUT"),
+        ]
+    )
+    try:
+        result = calculate_minimum_yearly_repayment(
+            income_year,
+            opening_balance=data.get("opening_balance"),
+            remaining_term_years=int(data.get("remaining_term_years")),
+            actual_repayments=data.get("eligible_repayments") or 0,
+            loan_terms_reviewed=True,
+        )
+    except (CalculatorError, TypeError, ValueError) as exc:
+        rows.append(_div7a_row("Final status", "", "INPUT REQUIRED", str(exc)))
+        return pd.DataFrame(rows)
+
+    rows.extend(
+        [
+            _div7a_row("Benchmark rate", f"{result.benchmark_interest_rate:.2%}", "CALCULATED"),
+            _div7a_row("Minimum yearly repayment", str(result.minimum_yearly_repayment), "CALCULATED"),
+            _div7a_row("Repayment shortfall", str(result.repayment_shortfall), "CALCULATED"),
+            _div7a_row(
+                "Reviewed distributable surplus",
+                data.get("reviewed_distributable_surplus"),
+                "REVIEW REQUIRED" if result.repayment_shortfall > 0 else "OPTIONAL REVIEW",
+            ),
+            _div7a_row(
+                "Final status",
+                "",
+                (
+                    "MYR SATISFIED"
+                    if result.repayment_shortfall == 0
+                    else "MYR SHORTFALL - REVIEW REQUIRED"
+                ),
+                result.scope_note,
+            ),
+        ]
+    )
+    return pd.DataFrame(rows)
 
 
 def _extract_total_by_period(
@@ -1267,6 +1622,8 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
     clean_bs_df = reports.clean_bs
 
     depreciation_input = (load_job_config().get("reviewed_tax_depreciation") or {})
+    reviewed_tax_losses = load_job_config().get("reviewed_tax_losses") or {}
+    reviewed_div7a = load_job_config().get("reviewed_div7a") or {}
     reviewed_tax_depreciation_total = None
     if table_requested("depreciation") and depreciation_input.get("amount") is not None:
         reviewed_tax_depreciation_total = clean_amount(depreciation_input["amount"])
@@ -1327,12 +1684,12 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
     periods = list(_extract_net_profit_by_period(clean_pl_df)[0].keys())
 
     carry_forward_losses = (
-        _build_carry_forward_losses_input(periods)
+        _build_carry_forward_losses_input(periods, reviewed_tax_losses)
         if table_requested("carry_forward_losses")
         else pd.DataFrame()
     )
     rd_breakdown = (
-        pd.DataFrame(RD_BREAKDOWN_TEMPLATE)
+        _build_rd_tax_incentive_review_schedule(SELECTED_INCOME_YEAR)
         if table_requested("rd_tax_incentive")
         else pd.DataFrame()
     )
@@ -1342,6 +1699,10 @@ def build_workpaper(reports: CleanedReports | None = None) -> Workpaper:
         for key, (title, rows) in SUPPORT_TABLE_TEMPLATES.items()
         if table_requested(key)
     }
+    if table_requested("div7a"):
+        support_tables["Division 7A / Shareholder Loans"] = (
+            _build_div7a_review_schedule(SELECTED_INCOME_YEAR, reviewed_div7a)
+        )
     depreciation_table = support_tables.get("Tax Depreciation / Capital Allowances")
     if depreciation_table is not None and not depreciation_table.empty:
         depreciation_table.loc[0, "Amount"] = reviewed_tax_depreciation_total

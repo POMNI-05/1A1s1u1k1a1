@@ -10,7 +10,12 @@ import pandas as pd
 from openpyxl import Workbook, load_workbook
 
 from v1.cleaner import ReportInput
-from v1.workpaper_builder import _build_carry_forward_losses_input, _manual_adjustment_rows
+from v1.workpaper_builder import (
+    _build_carry_forward_losses_input,
+    _build_div7a_review_schedule,
+    _build_rd_tax_incentive_review_schedule,
+    _manual_adjustment_rows,
+)
 from v1.write_workbook import write_workbook
 
 
@@ -158,10 +163,98 @@ class OutputPresentationTests(unittest.TestCase):
         self.assertEqual(add_rows[0]["2026"], 125.0)
         self.assertEqual(add_rows[0]["2025"], 0.0)
         self.assertEqual(add_rows[0]["2024"], 0.0)
-        loss_inputs = _build_carry_forward_losses_input(["2026"])
-        self.assertEqual(loss_inputs["Period"].tolist(), ["2026"])
-        self.assertTrue(loss_inputs["Opening losses"].isna().all())
-        self.assertTrue(loss_inputs["Closing losses"].isna().all())
+        loss_inputs = _build_carry_forward_losses_input(
+            ["2026"],
+            {
+                "opening_losses": "120000",
+                "requested_utilisation": "60000",
+                "eligibility_confirmed": True,
+            },
+        )
+        self.assertIn("Schedule required trigger", loss_inputs["Review area"].tolist())
+        reviewed_loss_row = loss_inputs[
+            loss_inputs["Review area"].eq("Reviewed loss movement")
+        ].iloc[0]
+        self.assertEqual(reviewed_loss_row["Period"], "2026")
+        self.assertEqual(reviewed_loss_row["Reviewed available prior-year losses"], "120000")
+        self.assertEqual(reviewed_loss_row["Requested utilisation"], "60000")
+        self.assertTrue(pd.isna(reviewed_loss_row["Closing losses"]))
+        self.assertIn("not posted", reviewed_loss_row["Status"])
+
+    def test_selected_rd_schedule_is_review_gated_backend_output(self):
+        schedule = _build_rd_tax_incentive_review_schedule("2026")
+
+        self.assertIn("Registration gate", schedule["Review area"].tolist())
+        self.assertIn("Associate-payment check", schedule["Review area"].tolist())
+        self.assertIn("Accounting add-back agreement", schedule["Review area"].tolist())
+        self.assertTrue(schedule["Backend handshake"].str.contains("No Item 7D").any())
+        self.assertTrue(schedule["Status"].str.contains("no R&D claim posted").any())
+
+    def test_div7a_not_private_is_not_applicable(self):
+        schedule = _build_div7a_review_schedule(
+            "2026",
+            {"private_company_status": "not_private"},
+        )
+
+        self.assertEqual(schedule.iloc[-1]["Status"], "NOT APPLICABLE")
+
+    def test_div7a_payment_branch_is_review_only(self):
+        schedule = _build_div7a_review_schedule(
+            "2026",
+            {
+                "private_company_status": "confirmed_private",
+                "transaction_exists": "yes",
+                "transaction_type": "payment_private_expense",
+                "source_account": "Drawings",
+                "source_balance": "1000",
+            },
+        )
+
+        self.assertEqual(
+            schedule.iloc[-1]["Status"],
+            "POTENTIAL s109C ISSUE - REVIEW REQUIRED",
+        )
+
+    def test_div7a_compliant_loan_myr_satisfied(self):
+        schedule = _build_div7a_review_schedule(
+            "2025",
+            {
+                "private_company_status": "confirmed_private",
+                "transaction_exists": "yes",
+                "transaction_type": "loan",
+                "balance_direction": "shareholder_director_owes_company",
+                "shareholder_or_associate_status": "confirmed",
+                "opening_balance": "100000",
+                "fully_repaid_before_lodgment": "no",
+                "complying_loan_status": "confirmed",
+                "remaining_term_years": 5,
+                "eligible_repayments": "30000",
+            },
+        )
+
+        self.assertEqual(schedule.iloc[-1]["Status"], "MYR SATISFIED")
+        self.assertIn("Minimum yearly repayment", schedule["Review area"].tolist())
+
+    def test_div7a_compliant_loan_myr_shortfall(self):
+        schedule = _build_div7a_review_schedule(
+            "2025",
+            {
+                "private_company_status": "confirmed_private",
+                "transaction_exists": "yes",
+                "transaction_type": "loan",
+                "balance_direction": "shareholder_director_owes_company",
+                "shareholder_or_associate_status": "confirmed",
+                "opening_balance": "100000",
+                "fully_repaid_before_lodgment": "no",
+                "complying_loan_status": "confirmed",
+                "remaining_term_years": 5,
+                "eligible_repayments": "12000",
+            },
+        )
+
+        self.assertEqual(schedule.iloc[-1]["Status"], "MYR SHORTFALL - REVIEW REQUIRED")
+        shortfall = schedule[schedule["Review area"].eq("Repayment shortfall")].iloc[0]
+        self.assertEqual(shortfall["Reviewed fact"], "13556.00")
 
 
 if __name__ == "__main__":

@@ -10,8 +10,7 @@ APP_SUBTITLE = "ICGTAX Partners · Automated Tax Reconciliation"
 
 # ── Section headers ───────────────────────────────────────────────────────────
 SECTION_FILES = "Upload Balance Sheet and Profit & Loss sheets"
-SECTION_PROFILE = "Notes for workpaper"
-SECTION_DESCRIBE = "Workpaper context"
+SECTION_PROFILE = "Engagement information"
 SECTION_RESULT = "Result"
 SECTION_REVISE = "Questions & revision requests"
 SECTION_DEBUG = "Run details"
@@ -34,9 +33,16 @@ CLIENT_NAME_LABEL = "Client / engagement name"
 CLIENT_NAME_PLACEHOLDER = "e.g. Smith Holdings Pty Ltd FY2025"
 CLIENT_NAME_HELP = "Used in the output filename. Optional."
 
-# ── Company profile prompt ────────────────────────────────────────────────────
-COMPANY_TYPE_LABEL = "Company type"
-COMPANY_TYPES = [
+# ── Business profile prompt ───────────────────────────────────────────────────
+BUSINESS_PROFILE_LABEL = "Business profile / industry"
+BUSINESS_PROFILE_SECTION_TITLE = "Business profile"
+BUSINESS_PROFILE_SECTION_ICON = "🏢"
+BUSINESS_PROFILE_IMPACT_NOTE = (
+    "Used to pre-select likely review schedules and save engagement context. "
+    "Calculations still come only from uploaded workbooks, deterministic rules "
+    "and reviewed accountant inputs."
+)
+BUSINESS_PROFILE_OPTIONS = [
     "Service / consulting company",
     "Professional practice",
     "Product / trading company",
@@ -51,6 +57,80 @@ COMPANY_TYPES = [
     "Property development company",
     "Mixed operating group",
     "Other",
+]
+BUSINESS_PROFILE_ICONS = {
+    "Service / consulting company": "💼",
+    "Professional practice": "⚖️",
+    "Product / trading company": "📦",
+    "Retail / hospitality business": "🏪",
+    "Wholesale / distribution business": "🚚",
+    "Construction / contracting business": "🏗️",
+    "Manufacturing business": "🏭",
+    "Software / SaaS company": "💻",
+    "Technology company (possible R&D)": "🔬",
+    "Investment / holding company": "📈",
+    "Property investment company": "🏢",
+    "Property development company": "🏘️",
+    "Mixed operating group": "🧭",
+    "Other": "•",
+}
+
+ATO_STATUS_SECTION = "ATO company-return status"
+ATO_STATUS_IMPACT_NOTE = (
+    "These return-status facts feed the company tax-rate control below. "
+    "Special statuses block tax payable until an accountant confirms the rate."
+)
+ATO_STATUS_PRESET_LABEL = "Status preset"
+ATO_STATUS_PRESET_OPTIONS = [
+    "Private",
+    "Public",
+    "Special/review",
+    "Detailed",
+]
+ATO_RESIDENCY_LABEL = "Residency status"
+ATO_RESIDENCY_OPTIONS = [
+    "Australian resident company",
+    "Non-resident company",
+    "Non-resident company carrying on business through an Australian PE",
+    "Not required for selected entity type",
+]
+
+ATO_ENTITY_TYPE_LABEL = "Entity type for company return"
+ATO_ENTITY_TYPE_OPTIONS = [
+    "Private company",
+    "Public company",
+    "Non-profit company",
+    "Strata title body corporate",
+    "Corporate unit trust",
+    "Public trading trust",
+    "Trustee capacity / other special rate",
+    "Life insurance company / friendly society",
+    "Medium credit union",
+    "Other / review required",
+]
+ATO_SPECIAL_STATUS_LABEL = "Special status"
+ATO_SPECIAL_STATUS_OPTIONS = [
+    "Non-profit company",
+    "Trustee capacity / other special rate",
+    "Life insurance company / friendly society",
+    "Medium credit union",
+    "Other / review required",
+]
+
+ATO_ACTIVITY_LABEL = "Activity indicator"
+ATO_ACTIVITY_OPTIONS = [
+    "None / ordinary trading or investment activity",
+    "Life insurance or friendly society activity",
+    "Pooled development fund / special entity activity",
+    "Other activity requiring return-status review",
+]
+
+ATO_BUSINESS_INDICATORS_LABEL = "Business indicators"
+ATO_CONSOLIDATION_LABEL = "Consolidation status"
+ATO_CONSOLIDATION_OPTIONS = [
+    "Not a consolidated or MEC group member",
+    "Consolidated or MEC head company",
+    "Consolidated or MEC subsidiary member with non-membership period",
 ]
 
 COMPANY_PROFILE_LABEL = "Additional client notes"

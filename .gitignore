@@ -41,6 +41,7 @@ LICENSE
 frontend/uploads/*
 frontend/downloads/*
 frontend/jobs/*
+frontend/scan_jobs/*
 .pytest_cache/
 
 # But keep the folder placeholders

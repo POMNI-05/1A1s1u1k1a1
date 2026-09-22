@@ -19,6 +19,7 @@ Design:
 from __future__ import annotations
 
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -44,6 +45,12 @@ if str(FRONTEND_DIR) not in sys.path:
 
 import ui_text as T
 from job_runner import build_base_rate_entity_assessment, run_workpaper_job
+from scan_runner import (
+    cleanup_scan,
+    open_scan_source_files,
+    run_scan_job,
+    verify_scan_sources,
+)
 from ai_review import (
     ACCOUNTANT_DISPOSITION_STATUSES,
     audit_path_for_workpaper,
@@ -64,6 +71,113 @@ from workbook_canvas import (
 )
 
 
+def _ensure_ui_text_hot_reload_compatibility() -> None:
+    """Backfill renamed UI constants when Streamlit has cached an older module."""
+
+    fallbacks = {
+        "BUSINESS_PROFILE_LABEL": "Business profile / industry",
+        "BUSINESS_PROFILE_SECTION_TITLE": "Business profile",
+        "BUSINESS_PROFILE_SECTION_ICON": "🏢",
+        "BUSINESS_PROFILE_IMPACT_NOTE": (
+            "Used to pre-select likely review schedules and save engagement context. "
+            "Calculations still come only from uploaded workbooks, deterministic rules "
+            "and reviewed accountant inputs."
+        ),
+        "BUSINESS_PROFILE_OPTIONS": [
+            "Service / consulting company",
+            "Professional practice",
+            "Product / trading company",
+            "Retail / hospitality business",
+            "Wholesale / distribution business",
+            "Construction / contracting business",
+            "Manufacturing business",
+            "Software / SaaS company",
+            "Technology company (possible R&D)",
+            "Investment / holding company",
+            "Property investment company",
+            "Property development company",
+            "Mixed operating group",
+            "Other",
+        ],
+        "BUSINESS_PROFILE_ICONS": {
+            "Service / consulting company": "💼",
+            "Professional practice": "⚖️",
+            "Product / trading company": "📦",
+            "Retail / hospitality business": "🏪",
+            "Wholesale / distribution business": "🚚",
+            "Construction / contracting business": "🏗️",
+            "Manufacturing business": "🏭",
+            "Software / SaaS company": "💻",
+            "Technology company (possible R&D)": "🔬",
+            "Investment / holding company": "📈",
+            "Property investment company": "🏢",
+            "Property development company": "🏘️",
+            "Mixed operating group": "🧭",
+            "Other": "•",
+        },
+        "ATO_STATUS_SECTION": "ATO company-return status",
+        "ATO_STATUS_IMPACT_NOTE": (
+            "These return-status facts feed the company tax-rate control below. "
+            "Special statuses block tax payable until an accountant confirms the rate."
+        ),
+        "ATO_STATUS_PRESET_LABEL": "Status preset",
+        "ATO_STATUS_PRESET_OPTIONS": [
+            "Private",
+            "Public",
+            "Special/review",
+            "Detailed",
+        ],
+        "ATO_RESIDENCY_LABEL": "Residency status",
+        "ATO_RESIDENCY_OPTIONS": [
+            "Australian resident company",
+            "Non-resident company",
+            "Non-resident company carrying on business through an Australian PE",
+            "Not required for selected entity type",
+        ],
+        "ATO_ENTITY_TYPE_LABEL": "Entity type for company return",
+        "ATO_ENTITY_TYPE_OPTIONS": [
+            "Private company",
+            "Public company",
+            "Non-profit company",
+            "Strata title body corporate",
+            "Corporate unit trust",
+            "Public trading trust",
+            "Trustee capacity / other special rate",
+            "Life insurance company / friendly society",
+            "Medium credit union",
+            "Other / review required",
+        ],
+        "ATO_SPECIAL_STATUS_LABEL": "Special status",
+        "ATO_SPECIAL_STATUS_OPTIONS": [
+            "Non-profit company",
+            "Trustee capacity / other special rate",
+            "Life insurance company / friendly society",
+            "Medium credit union",
+            "Other / review required",
+        ],
+        "ATO_ACTIVITY_LABEL": "Activity indicator",
+        "ATO_ACTIVITY_OPTIONS": [
+            "None / ordinary trading or investment activity",
+            "Life insurance or friendly society activity",
+            "Pooled development fund / special entity activity",
+            "Other activity requiring return-status review",
+        ],
+        "ATO_CONSOLIDATION_LABEL": "Consolidation status",
+        "ATO_CONSOLIDATION_OPTIONS": [
+            "Not a consolidated or MEC group member",
+            "Consolidated or MEC head company",
+            "Consolidated or MEC subsidiary member with non-membership period",
+        ],
+    }
+
+    for name, value in fallbacks.items():
+        if not hasattr(T, name):
+            setattr(T, name, value)
+
+
+_ensure_ui_text_hot_reload_compatibility()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,7 +190,6 @@ OPTIONAL_TABLES = {
     "fbt_entertainment": "FBT / entertainment review table",
     "depreciation": "Tax depreciation / capital allowance table",
     "superannuation": "Superannuation timing table",
-    "gst_reconciliation": "GST / BAS reconciliation table",
     "related_party_loans": "Related party loan table",
     "psi": "Personal services income review table",
 }
@@ -190,9 +303,10 @@ def _save_history_metadata(
     *,
     result: dict[str, Any],
     client_name: str,
-    company_type: str,
+    business_profile_industry: str,
     company_profile_notes: str,
     company_profile: str,
+    ato_company_status: dict[str, Any],
     reviewer_notes: str,
     document_description: str,
     ato_policy_year: str,
@@ -228,9 +342,11 @@ def _save_history_metadata(
         "output_name": result.get("output_name", output_path.name),
         "output_path": str(output_path),
         "client_name": client_name,
-        "company_type": company_type,
+        "company_type": business_profile_industry,
+        "business_profile_industry": business_profile_industry,
         "company_profile_notes": company_profile_notes,
         "company_profile": company_profile,
+        "ato_company_status": ato_company_status,
         "reviewer_notes": reviewer_notes,
         "document_description": document_description,
         "ato_policy_year": ato_policy_year,
@@ -450,8 +566,11 @@ Reviewer instructions / special facts:
 What are these files / document description:
 {metadata.get("document_description", "")}
 
-Client/company profile:
+Client/business profile:
 {metadata.get("company_profile", "")}
+
+ATO company-return status:
+{metadata.get("ato_company_status", {})}
 
 ATO / ITR policy year:
 {policy_year}
@@ -646,8 +765,42 @@ def _render_metadata_block(metadata: dict[str, Any]) -> None:
     st.markdown("**What are these files**")
     st.write(metadata.get("document_description") or "—")
 
-    st.markdown("**Client / company profile**")
+    st.markdown("**Business profile / industry**")
+    st.write(
+        metadata.get("business_profile_industry")
+        or metadata.get("company_type")
+        or "—"
+    )
+
+    st.markdown("**Client / workpaper context**")
     st.write(metadata.get("company_profile") or "—")
+
+    ato_status = metadata.get("ato_company_status") or {}
+    if ato_status:
+        st.markdown("**ATO company-return status**")
+        status_lines = [
+            ato_status.get("residency_status"),
+            ato_status.get("entity_type"),
+            ato_status.get("activity_indicator"),
+            ato_status.get("consolidation_status"),
+        ]
+        st.write(" · ".join(str(line) for line in status_lines if line) or "—")
+        indicators = []
+        if ato_status.get("small_business_entity_indicator"):
+            indicators.append("Small business entity indicator selected")
+        if ato_status.get("base_rate_entity_indicator"):
+            indicators.append("Base-rate-entity indicator noted")
+        if ato_status.get("significant_global_entity"):
+            indicators.append("SGE")
+        if ato_status.get("cbc_reporting_entity"):
+            indicators.append("CBC reporting entity")
+        if indicators:
+            st.caption(" · ".join(indicators))
+        if ato_status.get("forces_rate_review"):
+            st.warning(
+                "ATO status requires accountant review before company tax payable "
+                "is calculated."
+            )
 
     st.markdown("**ATO / ITR policy year**")
     st.write(metadata.get("ato_policy_year") or "—")
@@ -689,6 +842,178 @@ def _render_metadata_block(metadata: dict[str, Any]) -> None:
             st.caption(f"• {name}")
     else:
         st.caption("—")
+
+
+def _build_ato_company_status(
+    *,
+    status_preset: str,
+    residency_status: str,
+    entity_type: str,
+    activity_indicator: str,
+    small_business_entity_indicator: bool,
+    base_rate_entity_indicator: bool,
+    significant_global_entity: bool,
+    cbc_reporting_entity: bool,
+    consolidation_status: str,
+) -> dict[str, Any]:
+    """Return display-only ATO return-status context for metadata/audit."""
+
+    review_triggers = {
+        "Non-profit company",
+        "Trustee capacity / other special rate",
+        "Life insurance company / friendly society",
+        "Medium credit union",
+        "Other / review required",
+        "Life insurance or friendly society activity",
+        "Pooled development fund / special entity activity",
+        "Other activity requiring return-status review",
+    }
+    selected = {entity_type, activity_indicator}
+    forces_rate_review = bool(selected & review_triggers)
+    review_reason = ""
+    if forces_rate_review:
+        review_reason = (
+            "Selected ATO status may use a special company-rate treatment. "
+            "Company tax payable is withheld until accountant review confirms the rate."
+        )
+
+    return {
+        "status_preset": status_preset,
+        "residency_status": residency_status,
+        "entity_type": entity_type,
+        "activity_indicator": activity_indicator,
+        "small_business_entity_indicator": small_business_entity_indicator is True,
+        "base_rate_entity_indicator": base_rate_entity_indicator is True,
+        "significant_global_entity": significant_global_entity is True,
+        "cbc_reporting_entity": cbc_reporting_entity is True,
+        "consolidation_status": consolidation_status,
+        "forces_rate_review": forces_rate_review,
+        "rate_review_reason": review_reason,
+    }
+
+
+def _suggest_review_tables_for_business_profile(
+    business_profile_industry: str,
+    *,
+    company_profile_notes: str = "",
+    document_description: str = "",
+    reviewer_notes: str = "",
+) -> dict[str, str]:
+    """Return conservative review-scope defaults and their visible reasons."""
+
+    profile = str(business_profile_industry or "").lower()
+    context = " ".join(
+        [
+            profile,
+            str(company_profile_notes or "").lower(),
+            str(document_description or "").lower(),
+            str(reviewer_notes or "").lower(),
+        ]
+    )
+    suggestions: dict[str, str] = {}
+
+    if re.search(r"\b(loss|losses|tax loss|prior[- ]year loss|carry[- ]forward)\b", context):
+        suggestions["carry_forward_losses"] = (
+            "Notes or source description mention losses. Add the loss-review schedule "
+            "so eligibility and available losses are checked before any Item 7R deduction."
+        )
+
+    if any(term in profile for term in ("technology", "software", "saas", "r&d")):
+        suggestions["rd_tax_incentive"] = (
+            "Technology/R&D profile. Add the R&D review schedule for registration, "
+            "schedule tie-out, associate-payment and Item 7D/Item 21 checks."
+        )
+    elif re.search(r"\b(r&d|rnd|research and development|research)\b", context):
+        suggestions["rd_tax_incentive"] = (
+            "Notes mention R&D. Add the R&D review schedule before any R&D claim "
+            "or accounting add-back is considered."
+        )
+
+    if any(
+        term in profile
+        for term in (
+            "product",
+            "trading",
+            "retail",
+            "hospitality",
+            "wholesale",
+            "distribution",
+            "construction",
+            "contracting",
+            "manufacturing",
+            "property",
+        )
+    ):
+        suggestions["depreciation"] = (
+            "Asset/inventory-style profile. Check tax depreciation or capital "
+            "allowances before any Item 7F posting."
+        )
+
+    if any(
+        term in profile
+        for term in ("investment", "holding", "property", "mixed operating group")
+    ):
+        suggestions["related_party_loans"] = (
+            "Investment/holding/property profile. Related-party balances are more "
+            "likely and should be reviewed before disclosure or adjustment."
+        )
+
+    if re.search(r"\b(div\s*7a|division\s*7a|director loan|shareholder loan)\b", context):
+        suggestions["div7a"] = (
+            "Notes mention shareholder/director loans or Div 7A. Add the review "
+            "schedule for loan terms, repayments, benchmark interest and distributable surplus."
+        )
+
+    return suggestions
+
+
+def _format_business_profile_option(option: str) -> str:
+    """Display an icon with each profile while preserving the raw option value."""
+
+    icon = getattr(T, "BUSINESS_PROFILE_ICONS", {}).get(option, "•")
+    return f"{icon} {option}"
+
+
+def _render_requested_table_control(
+    *,
+    key: str,
+    suggested_review_tables: dict[str, str],
+) -> bool:
+    """Render a review-schedule checkbox with a visible suggestion reason."""
+
+    is_suggested = key in suggested_review_tables
+    label = OPTIONAL_TABLES[key]
+
+    with st.container(border=True):
+        if is_suggested:
+            st.markdown(
+                f"""
+                <div class="schedule-suggestion">
+                    <strong>Suggested review schedule</strong><br>
+                    {suggested_review_tables[key]}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        elif key == "carry_forward_losses":
+            st.caption(
+                "Carry-forward losses are added only when selected or suggested from "
+                "loss-related notes. The backend creates a review gate, not a posted deduction."
+            )
+
+        widget_key = f"requested_table_{key}"
+        checkbox_kwargs: dict[str, Any] = {
+            "key": widget_key,
+            "help": (
+                "Suggested by engagement context; untick if it is not relevant."
+                if is_suggested
+                else "Selected schedules are added to the workbook as review schedules."
+            ),
+        }
+        if widget_key not in st.session_state:
+            checkbox_kwargs["value"] = is_suggested
+
+        return st.checkbox(label, **checkbox_kwargs)
 
 
 def _render_detected_and_warnings(result: dict[str, Any]) -> None:
@@ -936,16 +1261,33 @@ def _render_debug_block(result: dict[str, Any]) -> None:
         st.code(result.get("backend_log", ""), language="text")
 
 
-def _render_tax_rate_control(ato_policy_year: str) -> tuple[str, dict[str, Any]]:
+def _render_tax_rate_control(
+    ato_policy_year: str,
+    *,
+    forced_review_reason: str = "",
+) -> tuple[str, dict[str, Any]]:
     """Render the mandatory company-rate decision and return its controlled outcome."""
 
     st.markdown('<div class="section-header">Company tax-rate determination</div>', unsafe_allow_html=True)
 
     with st.container(border=True):
-        st.markdown("**Confirm the treatment before calculating tax payable**")
+        if forced_review_reason:
+            st.markdown(
+                f"""
+                <div class="result-card result-card-warning" style="padding:0.75rem 0.9rem;margin-bottom:0;">
+                    <div style="font-weight:600;color:#7a4b00;">Tax rate requires confirmation</div>
+                    <div style="font-size:0.84rem;color:#5f4400;">
+                        {forced_review_reason}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            return "review_required", {}
+
         st.caption(
-            "The 25% rate requires a current-year base-rate-entity assessment. Until the rate "
-            "is confirmed, the workpaper will not calculate company tax payable."
+            "Confirm the company rate before calculating tax payable. Choose base-rate "
+            "assessment only when the current-year turnover and passive-income facts are reviewed."
         )
 
         tax_rate_decision = st.radio(
@@ -968,9 +1310,16 @@ def _render_tax_rate_control(ato_policy_year: str) -> tuple[str, dict[str, Any]]
             return "general", {}
 
         if tax_rate_decision == "review_required":
-            st.warning(
-                "Tax rate pending. Generate the reconciliation for review; company tax payable "
-                "will remain uncalculated."
+            st.markdown(
+                """
+                <div class="result-card result-card-warning" style="padding:0.75rem 0.9rem;margin-bottom:0;">
+                    <div style="font-weight:600;color:#7a4b00;">Tax rate requires confirmation</div>
+                    <div style="font-size:0.84rem;color:#5f4400;">
+                        Company tax payable will remain uncalculated until the reviewer confirms the applicable rate.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
             )
             return "review_required", {}
 
@@ -1179,6 +1528,51 @@ st.markdown(
         font-weight: 700;
     }
 
+    .profile-banner {
+        display: flex;
+        gap: 0.85rem;
+        align-items: flex-start;
+        border: 1px solid #cbd5e1;
+        border-left: 4px solid #0f766e;
+        border-radius: 8px;
+        background: #f8fafc;
+        padding: 0.85rem 1rem;
+        margin: 0.25rem 0 0.85rem;
+    }
+
+    .profile-banner-icon {
+        font-size: 1.35rem;
+        line-height: 1.2;
+    }
+
+    .profile-banner-title {
+        font-size: 0.95rem;
+        color: #0f172a;
+        font-weight: 700;
+        margin-bottom: 0.2rem;
+    }
+
+    .profile-banner-copy {
+        font-size: 0.83rem;
+        color: #475569;
+        margin: 0;
+    }
+
+    .schedule-suggestion {
+        border: 1px solid #fca5a5;
+        border-left: 4px solid #dc2626;
+        border-radius: 8px;
+        background: #fef2f2;
+        padding: 0.65rem 0.75rem;
+        margin: 0.15rem 0 0.5rem;
+        color: #7f1d1d;
+        font-size: 0.82rem;
+    }
+
+    .schedule-suggestion strong {
+        color: #991b1b;
+    }
+
     code {
         white-space: pre-wrap;
     }
@@ -1218,6 +1612,15 @@ if "current_workpaper_metadata" not in st.session_state:
 if "history_owner_id" not in st.session_state:
     st.session_state.history_owner_id = uuid.uuid4().hex
 
+if "generator_stage" not in st.session_state:
+    st.session_state.generator_stage = "upload"
+
+if "scan_result" not in st.session_state:
+    st.session_state.scan_result = None
+
+if "review_answers" not in st.session_state:
+    st.session_state.review_answers = {}
+
 # Preserve an in-progress browser session after the navigation terminology
 # changed. The old values were internal UI states, never persisted tax data.
 if st.session_state.view_mode == "new":
@@ -1256,6 +1659,9 @@ st.markdown("<hr style='margin:0.8rem 0 1rem;'>", unsafe_allow_html=True)
 if st.session_state.view_mode == "editor":
     # The spreadsheet canvas owns the editing surface; no side-panel form.
     left, right = st.columns([0.001, 0.999], gap="small")
+elif st.session_state.view_mode == "generator":
+    left = st.container()
+    right = None
 else:
     left, right = st.columns([1, 1], gap="large")
 
@@ -1328,259 +1734,501 @@ with left:
         st.markdown(f'<div class="app-title">{T.APP_TITLE}</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="app-subtitle">{T.APP_SUBTITLE}</div>', unsafe_allow_html=True)
 
-        # ── Upload files ─────────────────────────────────────────────────────
-        st.markdown(f'<div class="section-header">{T.SECTION_FILES}</div>', unsafe_allow_html=True)
+        stage = st.session_state.generator_stage
+        st.markdown(f"**Workflow:** {'Upload & profile' if stage == 'upload' else 'Scan & confirm' if stage == 'review' else 'Generate / result'}")
 
-        with st.container(border=True):
-            st.markdown("**Support multiple files. " \
-            "The system detects the relevant sheets and ignores unrelated files.**")
-            uploaded_files = st.file_uploader(
-                T.UPLOAD_FILES_LABEL,
-                type=T.UPLOAD_FILE_TYPES,
-                accept_multiple_files=True,
-                key=f"excel_files_uploader_{st.session_state.upload_key_nonce}",
-                help=T.UPLOAD_FILES_HELP,
-            )
-
-            if uploaded_files:
-                st.caption(f"{len(uploaded_files)} {T.UPLOAD_SELECTED_PREFIX}")
-                for uploaded_file in uploaded_files:
-                    st.caption(f"• {uploaded_file.name}")
-
-        # ── Engagement context ───────────────────────────────────────────────
-        st.markdown(f'<div class="section-header">{T.SECTION_PROFILE}</div>', unsafe_allow_html=True)
-
-        context_col_1, context_col_2, context_col_3 = st.columns([1.15, 2.85, 0.8])
-        with context_col_1:
-            client_name = st.text_input(
-                T.CLIENT_NAME_LABEL,
-                placeholder=T.CLIENT_NAME_PLACEHOLDER,
-                help=T.CLIENT_NAME_HELP,
-            )
-        with context_col_2:
-            company_type = st.radio(
-                T.COMPANY_TYPE_LABEL,
-                options=T.COMPANY_TYPES,
-                index=0,
-                horizontal=True,
-            )
-        with context_col_3:
-            ato_policy_year = st.selectbox(
-                "Income year",
-                options=ATO_POLICY_YEARS,
-                index=0,
-                help="Select the income-year rules used for the workpaper and tax-rate assessment.",
-            )
-
-        company_profile_notes = ""
-        with st.expander("Add client notes (optional)", expanded=False):
-            company_profile_notes = st.text_area(
-                T.COMPANY_PROFILE_LABEL,
-                placeholder=T.COMPANY_PROFILE_PLACEHOLDER,
-                help=T.COMPANY_PROFILE_HELP,
-                height=90,
-            )
-
-        company_profile = f"{company_type}. {company_profile_notes}".strip(". ")
-
-        tax_rate_choice, base_rate_entity_assessment = _render_tax_rate_control(ato_policy_year)
-
-        # ── Reconciliation scope ─────────────────────────────────────────────
-        st.markdown('<div class="section-header">Reconciliation scope</div>', unsafe_allow_html=True)
-        st.caption(
-            "Select the schedules that are relevant to this file. The goal is a focused review, "
-            "not a generic checklist."
-        )
-        st.markdown("**Add relevant review schedules**")
-        st.caption("Tick only the review schedules that should appear in this workbook.")
-        requested_tables = {
-            key: st.checkbox(
-                OPTIONAL_TABLES[key],
-                value=False,
-                key=f"requested_table_{key}",
-                help="Selected schedules are added to the workbook." if key == "carry_forward_losses" else None,
-            )
-            for key in OPTIONAL_TABLES
-        }
-
-        reviewed_tax_depreciation = ""
-        tax_depreciation_approved_for_posting = False
-        if requested_tables["depreciation"]:
-            with st.expander("Tax depreciation input", expanded=True):
-                st.caption(
-                    "Enter the reviewed tax decline-in-value deduction only. A detected "
-                    "depreciation schedule is support evidence; this amount will not post "
-                    "to Item 7F unless an accountant explicitly approves it below."
+        if stage == "upload":
+            st.markdown('<div class="section-header">1. Upload & profile</div>', unsafe_allow_html=True)
+            with st.container(border=True):
+                client_name = st.text_input(
+                    T.CLIENT_NAME_LABEL,
+                    placeholder=T.CLIENT_NAME_PLACEHOLDER,
+                    help=T.CLIENT_NAME_HELP,
+                    key="stage1_client_name",
                 )
-                reviewed_tax_depreciation = st.text_input(
-                    "Reviewed tax depreciation deduction (Item 7F)",
-                    placeholder="Example: 12,345.67",
-                    help="Leave blank when the deduction has not been reviewed.",
-                )
-                tax_depreciation_approved_for_posting = st.checkbox(
-                    "Accountant approved this amount for Item 7F posting",
-                    value=False,
-                    disabled=not str(reviewed_tax_depreciation).strip(),
-                )
-
-        # ── Optional workpaper context ───────────────────────────────────────
-        st.markdown(f'<div class="section-header">{T.SECTION_DESCRIBE}</div>', unsafe_allow_html=True)
-        st.caption("Add only the details that will help explain or review this workpaper.")
-
-        document_description = ""
-        with st.expander("Describe source files (optional)", expanded=False):
-            document_description = st.text_area(
-                T.DOC_DESCRIPTION_LABEL,
-                placeholder=T.DOC_DESCRIPTION_PLACEHOLDER,
-                help=T.DOC_DESCRIPTION_HELP,
-                height=90,
-            )
-
-        reviewer_notes = ""
-        with st.expander("Add reviewer instructions or special facts (optional)", expanded=False):
-            reviewer_notes = st.text_area(
-                "Reviewer instructions / special facts",
-                placeholder=(
-                    "Example: Prior-year tax losses exist; R&D claim expected; "
-                    "director loan may need Div 7A review; check consulting income classification."
-                ),
-                height=80,
-            )
-
-        # ── Optional AI review ───────────────────────────────────────────────
-        ai_provider = "None"
-        ai_model = ""
-        api_key = ""
-        run_ai_face_check = False
-
-        with st.expander("Optional AI review", expanded=False):
-            st.markdown(
-                """
-                <div class="admin-section">
-                    <div class="admin-label">Display-only review</div>
-                    <p style="font-size:0.85rem;color:#475569;margin:0.35rem 0 0;">
-                        Gemini or Grok can review minimised, deterministic decision evidence after
-                        generation. This is optional and never replaces accountant review.
-                    </p>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            ai_provider = st.selectbox(
-                "AI provider",
-                options=AI_PROVIDER_OPTIONS,
-                index=0,
-                help="Optional display-only review after workbook generation.",
-                key="admin_ai_provider",
-            )
-
-            if ai_provider != "None":
-                api_key = st.text_input(
-                    f"{ai_provider} API key",
-                    type="password",
-                    placeholder=f"Paste {ai_provider} API key for this session",
-                    help=(
-                        "The key is used for this Streamlit run only. "
-                        "For production, prefer Streamlit secrets or environment variables."
-                    ),
-                    key="admin_ai_api_key",
-                )
-
-                ai_model = st.selectbox(
-                    "Model",
-                    options=AI_MODEL_OPTIONS.get(ai_provider, []),
+                ato_policy_year = st.selectbox(
+                    "Income year",
+                    options=ATO_POLICY_YEARS,
                     index=0,
-                    help="Select the model used for the optional AI review.",
-                    key="admin_ai_model",
+                    help="Saved as profile context for scan; tax-rate assessment is confirmed after scan.",
+                    key="stage1_ato_policy_year",
                 )
+                profile_entity_type = st.selectbox(
+                    "Entity type",
+                    options=["Private company", "Public company", "Special / unsure"],
+                    index=0,
+                    help="Profile context only. Legal/tax statuses are confirmed after scan.",
+                    key="stage1_profile_entity_type",
+                )
+                business_profile_industry = st.selectbox(
+                    T.BUSINESS_PROFILE_LABEL,
+                    options=T.BUSINESS_PROFILE_OPTIONS,
+                    index=0,
+                    format_func=_format_business_profile_option,
+                    key="stage1_business_profile_industry",
+                    help=T.BUSINESS_PROFILE_IMPACT_NOTE,
+                )
+                uploaded_files = st.file_uploader(
+                    T.UPLOAD_FILES_LABEL,
+                    type=T.UPLOAD_FILE_TYPES,
+                    accept_multiple_files=True,
+                    key=f"excel_files_uploader_{st.session_state.upload_key_nonce}",
+                    help=T.UPLOAD_FILES_HELP,
+                )
+                reviewer_notes = st.text_area(
+                    "Reviewer / source note",
+                    placeholder="Optional context for the scan and review trail.",
+                    height=90,
+                    key="stage1_reviewer_notes",
+                )
+                if uploaded_files:
+                    st.caption(f"{len(uploaded_files)} file(s) selected")
+                    for uploaded_file in uploaded_files:
+                        st.caption(f"- {uploaded_file.name}")
 
-            run_ai_face_check = st.checkbox(
-                "Run AI face-check after workbook generation",
-                value=False,
-                disabled=ai_provider == "None",
-                help=(
-                    "Sends minimised deterministic review evidence, not the workbook, file paths "
-                    "or backend logs. This should not replace accountant review."
-                ),
-                key="admin_run_ai_face_check",
+                if st.button("Scan files", type="primary", use_container_width=True):
+                    profile = {
+                        "client_name": client_name,
+                        "ato_policy_year": ato_policy_year,
+                        "profile_entity_type": profile_entity_type,
+                        "business_profile_industry": business_profile_industry,
+                        "reviewer_notes": reviewer_notes,
+                    }
+                    with st.spinner("Scanning uploaded files without tax calculations..."):
+                        scan_result = run_scan_job(
+                            uploaded_files=uploaded_files,
+                            profile=profile,
+                        )
+                    if scan_result.get("status") != "success":
+                        st.error(scan_result.get("error_message") or "Scan failed.")
+                        if scan_result.get("backend_log"):
+                            with st.expander("Scan log", expanded=False):
+                                st.code(scan_result["backend_log"])
+                    else:
+                        st.session_state.scan_result = scan_result
+                        st.session_state.review_answers = {}
+                        st.session_state.generator_stage = "review"
+                        st.rerun()
+
+        elif stage == "review":
+            scan_result = st.session_state.scan_result or {}
+            profile = scan_result.get("profile") or {}
+            suggestions = {item["review_area"]: item for item in scan_result.get("suggestions", [])}
+            profile_suggestions = _suggest_review_tables_for_business_profile(
+                profile.get("business_profile_industry", ""),
+                reviewer_notes=profile.get("reviewer_notes", ""),
             )
+            suggested_review_tables = {
+                key: value.get("reason", "")
+                for key, value in suggestions.items()
+                if key in OPTIONAL_TABLES
+            }
+            suggested_review_tables.update(profile_suggestions)
+            generation_payload: dict[str, Any] = {}
+            blocking_items: list[str] = []
 
-            if run_ai_face_check and ai_provider != "None" and not api_key:
-                st.warning(f"Please enter a {ai_provider} API key, or turn off AI face-check.")
+            left_scan, right_review = st.columns([1, 1])
+            with left_scan:
+                st.markdown('<div class="section-header">System found</div>', unsafe_allow_html=True)
+                with st.container(border=True):
+                    st.markdown("**Detected reports**")
+                    for report in scan_result.get("detected_reports", []):
+                        st.caption(
+                            f"{report['report_type']} | {report['source_file']} | "
+                            f"{report['sheet_name']} | score {report['detection_score']}"
+                        )
+                    if not scan_result.get("detected_reports"):
+                        st.info("No reports detected yet.")
 
-            st.session_state["AI_PROVIDER"] = ai_provider
-            st.session_state["AI_MODEL"] = ai_model
-            st.session_state["AI_API_KEY"] = api_key
-            st.session_state["AI_API_KEY_ENTERED"] = bool(api_key)
+                with st.container(border=True):
+                    st.markdown("**Observed accounts / evidence**")
+                    observations = scan_result.get("observations", [])
+                    if observations:
+                        for observation in observations[:30]:
+                            amount = observation.get("amount")
+                            amount_text = "—" if amount is None else f"${amount:,.2f}"
+                            st.caption(
+                                f"{observation['id']}: {observation['account']} | {amount_text} | "
+                                f"{observation['report']} / {observation.get('section') or 'Unsectioned'}"
+                            )
+                    else:
+                        st.caption("No review-trigger account wording detected.")
 
-        # ── Generate ─────────────────────────────────────────────────────────
-        st.markdown("")
+                with st.container(border=True):
+                    st.markdown("**Suggested review areas**")
+                    if suggested_review_tables:
+                        for key, reason in suggested_review_tables.items():
+                            st.markdown(
+                                f"<div class='schedule-suggestion'><strong>{OPTIONAL_TABLES.get(key, key)}</strong><br>{reason}</div>",
+                                unsafe_allow_html=True,
+                            )
+                    else:
+                        st.caption("No scanner suggestions. Reviewers can still add areas on the right.")
+                    for warning in scan_result.get("warnings", []):
+                        st.warning(warning)
 
-        generate_clicked = st.button(
-            T.GENERATE_BUTTON_LABEL,
-            type="primary",
-            use_container_width=True,
-        )
+                if st.button("Reset scan", use_container_width=True):
+                    cleanup_scan(st.session_state.scan_result)
+                    st.session_state.scan_result = None
+                    st.session_state.job_result = None
+                    st.session_state.generator_stage = "upload"
+                    st.session_state.upload_key_nonce += 1
+                    st.rerun()
 
-        if generate_clicked:
-            if not uploaded_files:
-                st.error(T.ERROR_NO_FILES)
+            with right_review:
+                st.markdown('<div class="section-header">Reviewer confirms</div>', unsafe_allow_html=True)
 
-            elif run_ai_face_check and ai_provider != "None" and not api_key:
-                st.error(
-                    f"Please enter a {ai_provider} API key in Optional AI review, "
-                    "or turn off AI face-check."
+                ato_policy_year = profile.get("ato_policy_year", "2026")
+                client_name = profile.get("client_name", "")
+                business_profile_industry = profile.get("business_profile_industry", "Other")
+                company_profile_notes = profile.get("profile_entity_type", "")
+                reviewer_notes = profile.get("reviewer_notes", "")
+                company_profile = f"{business_profile_industry}. {company_profile_notes}".strip(". ")
+                document_description = "Scanned staged upload"
+
+                with st.container(border=True):
+                    ato_status_preset = st.radio(
+                        T.ATO_STATUS_PRESET_LABEL,
+                        options=T.ATO_STATUS_PRESET_OPTIONS,
+                        index=0 if profile.get("profile_entity_type") == "Private company" else 1 if profile.get("profile_entity_type") == "Public company" else 2,
+                        horizontal=True,
+                        key="stage2_ato_status_preset",
+                    )
+                    residency_status = "Australian resident company"
+                    entity_type = "Public company" if ato_status_preset == "Public" else "Private company"
+                    activity_indicator = "None / ordinary trading or investment activity"
+                    consolidation_status = "Not a consolidated or MEC group member"
+                    small_business_entity_indicator = False
+                    base_rate_entity_indicator = False
+                    significant_global_entity = False
+                    cbc_reporting_entity = False
+                    if ato_status_preset == "Special/review":
+                        entity_type = st.selectbox(
+                            T.ATO_SPECIAL_STATUS_LABEL,
+                            options=T.ATO_SPECIAL_STATUS_OPTIONS,
+                            index=0,
+                            key="stage2_special_entity_type",
+                        )
+                    elif ato_status_preset == "Detailed":
+                        residency_status = st.selectbox(T.ATO_RESIDENCY_LABEL, T.ATO_RESIDENCY_OPTIONS, key="stage2_residency")
+                        entity_type = st.selectbox(T.ATO_ENTITY_TYPE_LABEL, T.ATO_ENTITY_TYPE_OPTIONS, key="stage2_entity_type")
+                        consolidation_status = st.selectbox(T.ATO_CONSOLIDATION_LABEL, T.ATO_CONSOLIDATION_OPTIONS, key="stage2_consolidation")
+                        activity_indicator = st.selectbox(T.ATO_ACTIVITY_LABEL, T.ATO_ACTIVITY_OPTIONS, key="stage2_activity")
+                        small_business_entity_indicator = st.checkbox("Small business entity", key="stage2_sbe")
+                        base_rate_entity_indicator = st.checkbox("Base rate entity", key="stage2_bre")
+                        significant_global_entity = st.checkbox("SGE", key="stage2_sge")
+                        cbc_reporting_entity = st.checkbox("CBC reporting entity", key="stage2_cbc")
+
+                ato_company_status = _build_ato_company_status(
+                    status_preset=ato_status_preset,
+                    residency_status=residency_status,
+                    entity_type=entity_type,
+                    activity_indicator=activity_indicator,
+                    small_business_entity_indicator=small_business_entity_indicator,
+                    base_rate_entity_indicator=base_rate_entity_indicator,
+                    significant_global_entity=significant_global_entity,
+                    cbc_reporting_entity=cbc_reporting_entity,
+                    consolidation_status=consolidation_status,
+                )
+                tax_rate_choice, base_rate_entity_assessment = _render_tax_rate_control(
+                    ato_policy_year,
+                    forced_review_reason=ato_company_status.get("rate_review_reason", ""),
                 )
 
-            else:
-                with st.spinner(T.GENERATING_SPINNER_LABEL):
-                    result = run_workpaper_job(
-                        extra_files=uploaded_files,
-                        company_profile=company_profile,
-                        document_description=document_description,
-                        client_name=client_name,
-                        ato_policy_year=ato_policy_year,
-                        requested_tables=requested_tables,
-                        reviewer_notes=reviewer_notes,
-                        run_ai_face_check=run_ai_face_check,
-                        company_tax_rate_category=tax_rate_choice,
-                        base_rate_entity_assessment=base_rate_entity_assessment,
-                        reviewed_tax_depreciation=reviewed_tax_depreciation,
-                        tax_depreciation_approved_for_posting=tax_depreciation_approved_for_posting,
-                        history_owner_id=st.session_state.history_owner_id,
-                        ai_provider=ai_provider,
-                        ai_model=ai_model,
-                        ai_api_key=api_key,
+                st.markdown("**Review schedules**")
+                requested_tables = {key: False for key in OPTIONAL_TABLES}
+                reviewed_tax_losses: dict[str, Any] = {}
+                reviewed_div7a: dict[str, Any] = {}
+
+                loss_existence = st.radio(
+                    "Does the company have reviewed prior-year tax losses available?",
+                    options=["No", "Yes", "Not sure / review required"],
+                    horizontal=True,
+                    key="stage2_prior_year_tax_losses_exist",
+                )
+                requested_tables["carry_forward_losses"] = loss_existence != "No"
+                if loss_existence == "Yes":
+                    opening_losses = st.text_input("Reviewed available prior-year tax losses", key="stage2_opening_losses")
+                    eligibility_confirmed = st.radio(
+                        "Has utilisation eligibility been reviewed?",
+                        options=["No", "Yes"],
+                        horizontal=True,
+                        key="stage2_loss_eligibility",
+                    ) == "Yes"
+                    requested_utilisation = st.text_input(
+                        "Proposed utilisation",
+                        disabled=not eligibility_confirmed,
+                        key="stage2_loss_utilisation",
                     )
+                    eligibility_basis = st.text_input(
+                        "Eligibility basis",
+                        disabled=not eligibility_confirmed,
+                        key="stage2_loss_basis",
+                    )
+                    reviewed_tax_losses = {
+                        "opening_losses": opening_losses,
+                        "requested_utilisation": requested_utilisation,
+                        "eligibility_confirmed": eligibility_confirmed,
+                        "eligibility_basis": eligibility_basis,
+                        "review_note": st.text_area("Tax loss review note", height=70, key="stage2_loss_note"),
+                        "approved_for_posting": False,
+                    }
+
+                for key in OPTIONAL_TABLES:
+                    if key in {"carry_forward_losses", "div7a"}:
+                        continue
+                    default = key in suggested_review_tables
+                    requested_tables[key] = st.checkbox(
+                        OPTIONAL_TABLES[key],
+                        value=default,
+                        key=f"stage2_requested_table_{key}",
+                    )
+
+                manual_add = st.multiselect(
+                    "Add another review area",
+                    options=list(OPTIONAL_TABLES),
+                    format_func=lambda key: OPTIONAL_TABLES[key],
+                    key="stage2_manual_add_review_area",
+                )
+                for key in manual_add:
+                    requested_tables[key] = True
+
+                requested_tables["div7a"] = st.checkbox(
+                    OPTIONAL_TABLES["div7a"],
+                    value="div7a" in suggested_review_tables,
+                    key="stage2_requested_table_div7a",
+                )
+                if requested_tables["div7a"]:
+                    st.markdown("**Division 7A review workflow**")
+                    private_status_label = st.radio(
+                        "Division 7A entity status",
+                        ["Confirmed private company", "Not a private company", "Review required"],
+                        horizontal=True,
+                        key="stage2_div7a_private_status",
+                    )
+                    private_company_status = {
+                        "Confirmed private company": "confirmed_private",
+                        "Not a private company": "not_private",
+                        "Review required": "review_required",
+                    }[private_status_label]
+                    transaction_exists_label = "Unsure / review required"
+                    transaction_type = ""
+                    source_account = ""
+                    source_balance = ""
+                    balance_direction = "unsure"
+                    shareholder_status = "review_required"
+                    loan_amount = opening_balance = repayments_before_lodgment = outstanding_at_lodgment = ""
+                    fully_repaid = complying_status = "review_required"
+                    repayment_integrity_reviewed = False
+                    loan_start_year = loan_term_years = remaining_term_years = eligible_repayments = ""
+                    reviewed_distributable_surplus = div7a_source_note = div7a_review_note = ""
+                    if private_company_status == "confirmed_private":
+                        transaction_exists_label = st.radio(
+                            "Were there any payments, loans or debt forgiveness transactions involving a shareholder or associate during the income year?",
+                            ["No", "Yes", "Unsure / review required"],
+                            horizontal=True,
+                            key="stage2_div7a_transaction_exists",
+                        )
+                        if transaction_exists_label == "Yes":
+                            transaction_type_label = st.radio(
+                                "What type of transaction occurred?",
+                                [
+                                    "Loan",
+                                    "Payment / private expense",
+                                    "Debt forgiveness",
+                                    "Trust / UPE arrangement",
+                                    "Indirect / interposed entity arrangement",
+                                    "Other / unsure",
+                                ],
+                                key="stage2_div7a_transaction_type",
+                            )
+                            transaction_type = {
+                                "Loan": "loan",
+                                "Payment / private expense": "payment_private_expense",
+                                "Debt forgiveness": "debt_forgiveness",
+                                "Trust / UPE arrangement": "trust_upe",
+                                "Indirect / interposed entity arrangement": "indirect_interposed",
+                                "Other / unsure": "other_unsure",
+                            }[transaction_type_label]
+                            source_account = st.text_input("Relevant source account", key="stage2_div7a_source_account")
+                            source_balance = st.text_input("Source balance / amount", key="stage2_div7a_source_balance")
+                            if transaction_type == "loan":
+                                balance_direction = {
+                                    "Shareholder/director owes the company": "shareholder_director_owes_company",
+                                    "Company owes shareholder/director": "company_owes_shareholder_director",
+                                    "Unsure / review required": "unsure",
+                                }[st.radio("Who owes whom?", ["Shareholder/director owes the company", "Company owes shareholder/director", "Unsure / review required"], key="stage2_div7a_direction")]
+                                shareholder_status = {
+                                    "Confirmed": "confirmed",
+                                    "No": "no",
+                                    "Review required": "review_required",
+                                }[st.radio("Was the borrower a shareholder or an associate of a shareholder?", ["Confirmed", "No", "Review required"], horizontal=True, key="stage2_div7a_shareholder_status")]
+                                loan_amount = st.text_input("Original / current-year loan amount", key="stage2_div7a_loan_amount")
+                                opening_balance = st.text_input("Opening loan balance", key="stage2_div7a_opening_balance")
+                                repayments_before_lodgment = st.text_input("Repayments before lodgment day", key="stage2_div7a_repayments_before")
+                                outstanding_at_lodgment = st.text_input("Outstanding balance at lodgment day", key="stage2_div7a_outstanding")
+                                fully_repaid = {"Yes": "yes", "No": "no", "Review required": "review_required"}[
+                                    st.radio("Was the relevant loan fully repaid before lodgment day?", ["Yes", "No", "Review required"], horizontal=True, key="stage2_div7a_fully_repaid")
+                                ]
+                                if fully_repaid == "yes":
+                                    repayment_integrity_reviewed = st.checkbox("Repayment integrity reviewed", key="stage2_div7a_integrity")
+                                elif fully_repaid == "no":
+                                    complying_status = {"Confirmed": "confirmed", "No": "no", "Review required": "review_required"}[
+                                        st.radio("Was a complying Division 7A loan agreement in place by lodgment day?", ["Confirmed", "No", "Review required"], horizontal=True, key="stage2_div7a_complying")
+                                    ]
+                                    if complying_status == "confirmed":
+                                        loan_start_year = st.text_input("Loan start year", key="stage2_div7a_start_year")
+                                        loan_term_years = st.text_input("Loan term years", key="stage2_div7a_term")
+                                        remaining_term_years = st.text_input("Remaining term years", key="stage2_div7a_remaining")
+                                        eligible_repayments = st.text_input("Actual eligible repayments", key="stage2_div7a_eligible_repayments")
+                                    reviewed_distributable_surplus = st.text_input("Reviewed distributable surplus", key="stage2_div7a_surplus")
+                            else:
+                                st.warning("This branch is review-only in the MVP. No loan/MYR calculation will be performed.")
+                                div7a_source_note = st.text_area("Entities involved / supporting document reference", height=70, key="stage2_div7a_source_note")
+                        div7a_review_note = st.text_area("Division 7A reviewer note", height=70, key="stage2_div7a_note")
+                    else:
+                        st.info("Division 7A calculations are not run unless private-company status is confirmed by the reviewer.")
+
+                    reviewed_div7a = {
+                        "private_company_status": private_company_status,
+                        "transaction_exists": {"No": "no", "Yes": "yes", "Unsure / review required": "unsure"}.get(transaction_exists_label, "unsure"),
+                        "transaction_type": transaction_type,
+                        "source_account": source_account,
+                        "source_balance": source_balance,
+                        "balance_direction": balance_direction,
+                        "shareholder_or_associate_status": shareholder_status,
+                        "loan_amount": loan_amount,
+                        "opening_balance": opening_balance,
+                        "repayments_before_lodgment": repayments_before_lodgment,
+                        "outstanding_at_lodgment": outstanding_at_lodgment,
+                        "fully_repaid_before_lodgment": fully_repaid,
+                        "repayment_integrity_reviewed": repayment_integrity_reviewed,
+                        "complying_loan_status": complying_status,
+                        "loan_start_year": loan_start_year,
+                        "loan_term_years": loan_term_years,
+                        "remaining_term_years": remaining_term_years,
+                        "eligible_repayments": eligible_repayments,
+                        "reviewed_distributable_surplus": reviewed_distributable_surplus,
+                        "review_note": div7a_review_note,
+                        "source_note": div7a_source_note,
+                        "approved": False,
+                    }
+
+                reviewed_tax_depreciation = ""
+                tax_depreciation_approved_for_posting = False
+                if requested_tables.get("depreciation"):
+                    reviewed_tax_depreciation = st.text_input("Reviewed tax depreciation deduction (Item 7F)", key="stage2_tax_dep")
+                    tax_depreciation_approved_for_posting = st.checkbox(
+                        "Accountant approved this amount for Item 7F posting",
+                        disabled=not str(reviewed_tax_depreciation).strip(),
+                        key="stage2_tax_dep_approved",
+                    )
+
+                hash_ok, hash_errors = verify_scan_sources(scan_result)
+                if not hash_ok:
+                    blocking_items.extend(hash_errors)
+                generation_payload = {
+                    "company_profile": company_profile,
+                    "document_description": document_description,
+                    "client_name": client_name,
+                    "ato_policy_year": ato_policy_year,
+                    "requested_tables": requested_tables,
+                    "reviewer_notes": reviewer_notes,
+                    "tax_rate_choice": tax_rate_choice,
+                    "base_rate_entity_assessment": base_rate_entity_assessment,
+                    "reviewed_tax_losses": reviewed_tax_losses,
+                    "reviewed_div7a": reviewed_div7a,
+                    "reviewed_tax_depreciation": reviewed_tax_depreciation,
+                    "tax_depreciation_approved_for_posting": tax_depreciation_approved_for_posting,
+                    "business_profile_industry": business_profile_industry,
+                    "company_profile_notes": company_profile_notes,
+                    "ato_company_status": ato_company_status,
+                }
+
+            st.markdown("<hr>", unsafe_allow_html=True)
+            st.markdown("**Generate workpaper**")
+            requested_tables = generation_payload.get("requested_tables") or {}
+            st.caption(f"Reports: {len(scan_result.get('detected_reports', []))}")
+            st.caption(f"Included review areas: {', '.join(OPTIONAL_TABLES[k] for k, v in requested_tables.items() if v) or 'None'}")
+            if blocking_items:
+                for item in blocking_items:
+                    st.error(item)
+
+            if st.button("Generate workpaper from confirmed review", type="primary", use_container_width=True, disabled=bool(blocking_items)):
+                file_handles = []
+                try:
+                    file_handles = open_scan_source_files(scan_result)
+                    with st.spinner(T.GENERATING_SPINNER_LABEL):
+                        result = run_workpaper_job(
+                            extra_files=file_handles,
+                            company_profile=generation_payload["company_profile"],
+                            document_description=generation_payload["document_description"],
+                            client_name=generation_payload["client_name"],
+                            ato_policy_year=generation_payload["ato_policy_year"],
+                            requested_tables=generation_payload["requested_tables"],
+                            reviewer_notes=generation_payload["reviewer_notes"],
+                            run_ai_face_check=False,
+                            company_tax_rate_category=generation_payload["tax_rate_choice"],
+                            base_rate_entity_assessment=generation_payload["base_rate_entity_assessment"],
+                            reviewed_tax_losses=generation_payload["reviewed_tax_losses"],
+                            reviewed_div7a=generation_payload["reviewed_div7a"],
+                            reviewed_tax_depreciation=generation_payload["reviewed_tax_depreciation"],
+                            tax_depreciation_approved_for_posting=generation_payload["tax_depreciation_approved_for_posting"],
+                            history_owner_id=st.session_state.history_owner_id,
+                        )
+                finally:
+                    for handle in file_handles:
+                        handle.close()
 
                 _save_history_metadata(
                     result=result,
-                    client_name=client_name,
-                    company_type=company_type,
-                    company_profile_notes=company_profile_notes,
-                    company_profile=company_profile,
-                    reviewer_notes=reviewer_notes,
-                    document_description=document_description,
-                    ato_policy_year=ato_policy_year,
-                    uploaded_files=list(uploaded_files or []),
-                    ai_provider=ai_provider,
-                    ai_model=ai_model,
-                    run_ai_face_check=run_ai_face_check,
-                    company_tax_rate_category=tax_rate_choice,
-                    base_rate_entity_assessment=base_rate_entity_assessment,
-                    requested_tables=requested_tables,
+                    client_name=generation_payload["client_name"],
+                    business_profile_industry=generation_payload["business_profile_industry"],
+                    company_profile_notes=generation_payload["company_profile_notes"],
+                    company_profile=generation_payload["company_profile"],
+                    ato_company_status=generation_payload["ato_company_status"],
+                    reviewer_notes=generation_payload["reviewer_notes"],
+                    document_description=generation_payload["document_description"],
+                    ato_policy_year=generation_payload["ato_policy_year"],
+                    uploaded_files=[],
+                    ai_provider="None",
+                    ai_model="",
+                    run_ai_face_check=False,
+                    company_tax_rate_category=generation_payload["tax_rate_choice"],
+                    base_rate_entity_assessment=generation_payload["base_rate_entity_assessment"],
+                    requested_tables=generation_payload["requested_tables"],
                 )
-
                 output_path = result.get("output_path")
-                if output_path:
-                    st.session_state.current_workpaper_metadata = _load_history_metadata(output_path)
-                else:
-                    st.session_state.current_workpaper_metadata = {}
-
+                st.session_state.current_workpaper_metadata = _load_history_metadata(output_path) if output_path else {}
                 st.session_state.job_result = result
                 st.session_state.revision_response = None
-                st.session_state.view_mode = "generator"
+                if output_path:
+                    cleanup_scan(st.session_state.scan_result)
+                    st.session_state.scan_result = None
+                st.session_state.generator_stage = "result"
+                st.rerun()
+
+        elif stage == "result":
+            st.markdown('<div class="section-header">3. Generate / result</div>', unsafe_allow_html=True)
+            result = st.session_state.job_result or {}
+            if result.get("status") == "success":
+                st.success(T.SUCCESS_MESSAGE)
+                output_path = Path(result["output_path"])
+                with open(output_path, "rb") as f:
+                    st.download_button(
+                        T.DOWNLOAD_BUTTON_LABEL,
+                        data=f,
+                        file_name=result.get("output_name") or output_path.name,
+                        mime=T.DOWNLOAD_MIME,
+                        use_container_width=True,
+                    )
+            else:
+                st.error(result.get("error_message") or "Generation failed.")
+            if st.button("Start another staged workpaper", use_container_width=True):
+                st.session_state.job_result = None
+                st.session_state.current_workpaper_metadata = {}
+                st.session_state.generator_stage = "upload"
+                st.session_state.upload_key_nonce += 1
                 st.rerun()
 
     else:
@@ -1590,207 +2238,99 @@ with left:
 # ─────────────────────────────────────────────────────────────────────────────
 # RIGHT COLUMN
 # ─────────────────────────────────────────────────────────────────────────────
-with right:
-    if st.session_state.view_mode == "library":
-        st.markdown('<div class="section-header">Workpaper preview</div>', unsafe_allow_html=True)
+if right is not None:
+    with right:
+        if st.session_state.view_mode == "library":
+            st.markdown('<div class="section-header">Workpaper preview</div>', unsafe_allow_html=True)
 
-        selected_history_file = st.session_state.get("selected_history_file")
-
-        if selected_history_file:
-            selected_history_file = Path(selected_history_file)
-            history_metadata = _load_history_metadata(selected_history_file)
-
-            st.markdown(
-                f"""
-                <div class="result-card result-card-success">
-                    <div style="font-weight:600;font-size:1rem;color:#1a1a2e;margin-bottom:0.6rem;">
-                        Previous workpaper selected
+            selected_history_file = st.session_state.get("selected_history_file")
+            if selected_history_file:
+                selected_history_file = Path(selected_history_file)
+                history_metadata = _load_history_metadata(selected_history_file)
+                st.markdown(
+                    f"""
+                    <div class="result-card result-card-success">
+                        <div style="font-weight:600;font-size:1rem;color:#1a1a2e;margin-bottom:0.6rem;">
+                            Previous workpaper selected
+                        </div>
+                        <div style="font-size:0.82rem;color:#555;">
+                            File:
+                            <code style="font-family:'IBM Plex Mono',monospace;">
+                                {selected_history_file.name}
+                            </code>
+                        </div>
                     </div>
-                    <div style="font-size:0.82rem;color:#555;">
-                        File:
-                        <code style="font-family:'IBM Plex Mono',monospace;">
-                            {selected_history_file.name}
-                        </code>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            if selected_history_file.exists():
-                st.caption("Use the download button on the left to open this workbook.")
-
-                with st.expander("Saved metadata JSON", expanded=False):
-                    if history_metadata:
-                        st.json(history_metadata)
-                    else:
-                        st.info("No sidecar metadata JSON found for this old workpaper.")
-
-                _render_ai_review_audit(selected_history_file)
-
-                st.markdown("<hr>", unsafe_allow_html=True)
-
-                st.caption("Use Review & edit to record a reviewer-controlled workbook revision.")
-
-            else:
-                st.warning("Selected history file no longer exists.")
-        else:
-            st.info("Select a previous workpaper from the left panel.")
-
-    elif st.session_state.view_mode == "editor":
-        editor_path_raw = st.session_state.get("editor_workpaper_path")
-        editor_path = Path(editor_path_raw) if editor_path_raw else None
-        if not editor_path or not editor_path.exists():
-            st.info("Open Main page, choose a workpaper and select Open in Review & edit.")
-        else:
-            try:
-                workbook_sheets = load_workbook_canvas(editor_path)
-            except Exception as exc:
-                st.error(f"Could not open this workbook for browser editing: {exc}")
-                workbook_sheets = []
-
-            if not workbook_sheets:
-                st.warning("This workbook has no visible worksheets to edit.")
-            else:
-                edits = render_workbook_canvas(
-                    workbook_sheets,
-                    key=f"workbook_canvas_{editor_path.name}",
+                    """,
+                    unsafe_allow_html=True,
                 )
-                footer_left, footer_right = st.columns([1, 1])
-                with footer_left:
-                    st.caption(f"{len(edits)} unsaved cell change(s) · all visible cells are editable")
-                with footer_right:
-                    if st.button("Save a new Excel revision", type="primary", use_container_width=True):
-                        try:
-                            revision_path, audit_path, change_count = export_manual_workbook_revision(
-                                source_workbook=editor_path,
-                                sheets=workbook_sheets,
-                                edits=edits,
-                            )
-                            _save_revision_metadata(
-                                source_workpaper=editor_path,
-                                revision_workpaper=revision_path,
-                                revision_audit_path=audit_path,
-                            )
-                        except WorkbookCanvasError as exc:
-                            st.error(str(exc))
-                        except Exception as exc:
-                            st.error(f"Could not save the manual workbook revision: {exc}")
+                if selected_history_file.exists():
+                    st.caption("Use the download button on the left to open this workbook.")
+                    with st.expander("Saved metadata JSON", expanded=False):
+                        if history_metadata:
+                            st.json(history_metadata)
                         else:
-                            st.session_state.revision_response = {
-                                "path": str(revision_path),
-                                "audit_path": str(audit_path),
-                                "change_count": change_count,
-                            }
-                            st.success(f"Saved {change_count} cell change(s) to a new workbook. Original unchanged.")
-                revision_response = st.session_state.get("revision_response") or {}
-                revision_path_raw = revision_response.get("path")
-                if revision_path_raw and Path(revision_path_raw).exists():
-                    revision_path = Path(revision_path_raw)
-                    _download_workbook_button(path=revision_path, label="Download revised Excel", file_name=revision_path.name, key=f"download_revision_{revision_path.name}")
-
-    else:
-        result = st.session_state.job_result
-
-        if result is None:
-            st.markdown(
-                """
-                <div style="margin-top:3rem;color:#bbb;text-align:center;">
-                    <div style="font-size:2.5rem;margin-bottom:0.5rem;">📄</div>
-                    <div style="font-size:0.9rem;">
-                        Upload Excel workbook(s) and click <strong>Generate workpaper</strong>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-        elif result.get("status") == "error":
-            st.markdown(f'<div class="section-header">{T.SECTION_RESULT}</div>', unsafe_allow_html=True)
-            if result.get("error_code") == "unsupported_income_year":
-                selected_year = result.get("selected_income_year") or "the selected value"
-                supported_years = result.get("supported_income_years") or ATO_POLICY_YEARS
-                st.error(f"Income year {selected_year!r} is not supported for this workpaper.")
-                st.info(
-                    "Change **Income year** in the left panel to one of: "
-                    f"{', '.join(str(year) for year in supported_years)}. "
-                    "Then generate the workpaper again. No workbook was created."
-                )
-            elif not _render_safety_stop_panel(result):
-                st.error(T.ERROR_PIPELINE)
-
-            uploaded_names = result.get("uploaded_files") or []
-            if uploaded_names:
-                st.markdown("**Uploaded files received:**")
-                for name in uploaded_names:
-                    st.caption(f"• {name}")
-
-            with st.expander("Error details", expanded=True):
-                st.code(result.get("error_message", "Unknown error"), language="text")
-
-            _render_debug_block(result)
-
-        else:
-            # 1. Result
-            st.markdown(f'<div class="section-header">{T.SECTION_RESULT}</div>', unsafe_allow_html=True)
-
-            st.markdown(
-                f"""
-                <div class="result-card result-card-success">
-                    <div style="font-weight:600;font-size:1rem;color:#1a1a2e;margin-bottom:0.6rem;">
-                        ✓ &nbsp;{T.SUCCESS_HEADER}
-                    </div>
-                    <div style="font-size:0.82rem;color:#555;">
-                        Output:
-                        <code style="font-family:'IBM Plex Mono',monospace;">
-                            {result.get("output_name", "")}
-                        </code>
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-
-            output_path = result.get("output_path")
-            if output_path and Path(output_path).exists():
-                _download_workbook_button(
-                    path=Path(output_path),
-                    label=T.DOWNLOAD_BUTTON,
-                    file_name=result.get("output_name", "workpaper.xlsx"),
-                    key="download_current_workpaper",
-                )
-                if st.button(
-                    "Open in Review & edit",
-                    type="primary",
-                    use_container_width=True,
-                    key="open_current_workpaper_in_editor",
-                ):
-                    st.session_state.editor_workpaper_path = str(output_path)
-                    st.session_state.view_mode = "editor"
-                    st.rerun()
+                            st.info("No sidecar metadata JSON found for this old workpaper.")
+                    _render_ai_review_audit(selected_history_file)
+                    st.markdown("<hr>", unsafe_allow_html=True)
+                    st.caption("Use Review & edit to record a reviewer-controlled workbook revision.")
+                else:
+                    st.warning("Selected history file no longer exists.")
             else:
-                st.warning(T.ERROR_OUTPUT_MISSING)
+                st.info("Select a previous workpaper from the left panel.")
 
-            metadata = st.session_state.current_workpaper_metadata
-            if not metadata and output_path:
-                metadata = _load_history_metadata(output_path)
+        elif st.session_state.view_mode == "editor":
+            editor_path_raw = st.session_state.get("editor_workpaper_path")
+            editor_path = Path(editor_path_raw) if editor_path_raw else None
+            if not editor_path or not editor_path.exists():
+                st.info("Open Main page, choose a workpaper and select Open in Review & edit.")
+            else:
+                try:
+                    workbook_sheets = load_workbook_canvas(editor_path)
+                except Exception as exc:
+                    st.error(f"Could not open this workbook for browser editing: {exc}")
+                    workbook_sheets = []
 
-            with st.expander("Saved user inputs for this workpaper", expanded=True):
-                _render_metadata_block(metadata)
-
-            _render_ai_review_audit(output_path)
-
-            st.markdown("<hr>", unsafe_allow_html=True)
-
-            # 2. Detected reports and backend warnings
-            _render_detected_and_warnings(result)
-
-            st.markdown("<hr>", unsafe_allow_html=True)
-
-            # 3. Custom ITR override
-            _render_custom_override_box()
-
-            st.markdown("<hr>", unsafe_allow_html=True)
-
-            # Optional debug after the main workflow
-            _render_debug_block(result)
+                if not workbook_sheets:
+                    st.warning("This workbook has no visible worksheets to edit.")
+                else:
+                    edits = render_workbook_canvas(
+                        workbook_sheets,
+                        key=f"workbook_canvas_{editor_path.name}",
+                    )
+                    footer_left, footer_right = st.columns([1, 1])
+                    with footer_left:
+                        st.caption(f"{len(edits)} unsaved cell change(s) · all visible cells are editable")
+                    with footer_right:
+                        if st.button("Save a new Excel revision", type="primary", use_container_width=True):
+                            try:
+                                revision_path, audit_path, change_count = export_manual_workbook_revision(
+                                    source_workbook=editor_path,
+                                    sheets=workbook_sheets,
+                                    edits=edits,
+                                )
+                                _save_revision_metadata(
+                                    source_workpaper=editor_path,
+                                    revision_workpaper=revision_path,
+                                    revision_audit_path=audit_path,
+                                )
+                            except WorkbookCanvasError as exc:
+                                st.error(str(exc))
+                            except Exception as exc:
+                                st.error(f"Could not save the manual workbook revision: {exc}")
+                            else:
+                                st.session_state.revision_response = {
+                                    "path": str(revision_path),
+                                    "audit_path": str(audit_path),
+                                    "change_count": change_count,
+                                }
+                                st.success(f"Saved {change_count} cell change(s) to a new workbook. Original unchanged.")
+                    revision_response = st.session_state.get("revision_response") or {}
+                    revision_path_raw = revision_response.get("path")
+                    if revision_path_raw and Path(revision_path_raw).exists():
+                        revision_path = Path(revision_path_raw)
+                        _download_workbook_button(
+                            path=revision_path,
+                            label="Download revised Excel",
+                            file_name=revision_path.name,
+                            key=f"download_revision_{revision_path.name}",
+                        )
